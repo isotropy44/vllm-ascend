@@ -24,6 +24,8 @@
 
 namespace Catlass::Gemm::Kernel {
 
+constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = SELF_STATE_OFFSET + 8 * 1024;
+
 template <class ArchTag>
 class BlockQuant
 {
@@ -618,6 +620,79 @@ public:
     }
 
     CATLASS_DEVICE
+    uint32_t GetTokenOrderMetadataIndex(uint32_t localExpertId, uint32_t srcRank, uint32_t localOrdinal)
+    {
+        return (localExpertId * epRankSize + srcRank) * axisBS * axisK + localOrdinal;
+    }
+
+    CATLASS_DEVICE
+    void WriteTokenOrderMetadata(uint32_t dstRankId, uint32_t localExpertId, uint32_t localOrdinal, uint32_t srcTokenId)
+    {
+        AscendC::GlobalTensor<int32_t> tokenOrderMetadataTensor;
+        uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, epRankId, localOrdinal);
+        GM_ADDR metadataGM = GET_WIND_STATE_ADDR_BY_RANK_ID(dstRankId) + TOKEN_ORDER_METADATA_OFFSET +
+                             metadataIndex * sizeof(int32_t);
+        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ int32_t *)metadataGM);
+        tokenOrderMetadataTensor.SetValue(0, static_cast<int32_t>(srcTokenId));
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(
+            tokenOrderMetadataTensor[0]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    void WriteTokenOrderMetadataForExpert(int32_t dstExpertId)
+    {
+        uint32_t dstRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
+        uint32_t localExpertId = dstExpertId % moeExpertNumPerRank;
+        uint32_t localOrdinal = 0;
+        for (uint32_t tokenIndex = 0; tokenIndex < expertIdsCnt; ++tokenIndex) {
+            if (expertIdsTensor_(tokenIndex) != dstExpertId) {
+                continue;
+            }
+            WriteTokenOrderMetadata(dstRankId, localExpertId, localOrdinal, tokenIndex / axisK);
+            localOrdinal += 1;
+        }
+    }
+
+    CATLASS_DEVICE
+    int32_t GetCountOnlyStatusValue()
+    {
+        return (state == 0) ? 0 : 0x3F800000;
+    }
+
+    CATLASS_DEVICE
+    int32_t GetPublishStatusValue()
+    {
+        return (state == 0) ? 0x3F800000 : 0;
+    }
+
+    CATLASS_DEVICE
+    void PublishTokenCountStatus(uint32_t startExpertId, uint32_t endExpertId)
+    {
+        AscendC::GlobalTensor<int32_t> rankGMTensor;
+        int32_t statusValue = GetPublishStatusValue();
+        uint32_t offset = stateOffset * epRankId;
+        for (uint32_t rankIndex = startExpertId; rankIndex < endExpertId; ++rankIndex) {
+            uint32_t dstRankId = rankIndex;
+            if (moeExpertNumPerRank > 1 && (rankIndex >= sharedExpertRankNum)) {
+                dstRankId = ((rankIndex - sharedExpertRankNum) / moeExpertNumPerRank + sharedExpertRankNum);
+                offset =
+                    (epRankId + (rankIndex - sharedExpertRankNum) % moeExpertNumPerRank * epRankSize) * stateOffset;
+            }
+            GM_ADDR rankGM = (__gm__ uint8_t *)(GET_WIND_STATE_ADDR_BY_RANK_ID(dstRankId) + offset);
+            rankGMTensor.SetGlobalBuffer((__gm__ int32_t *)rankGM);
+            rankGMTensor.SetValue(0, statusValue);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(
+                rankGMTensor[0]);
+            __asm__ __volatile__("");
+        }
+    }
+
+    CATLASS_DEVICE
     void CalAndSendTokenCount()
     {
         uint32_t totalExpertNum = sharedExpertRankNum + moeExpertNum;
@@ -639,11 +714,10 @@ public:
         ubOffset += CEIL_UP(CEIL(expertCntUp, INT32_COUNT_PER_BLOCK) * INT32_COUNT_PER_BLOCK * UB_BLOCK_SIZE);
         AscendC::Duplicate(statusTensor_, (int32_t)0,
                            expertCntUp * INT32_COUNT_PER_BLOCK);
-        if (state == 0) {
-            // set the first number of every 8 numbers as 0x3F800000(float 1.0)
+        if (state != 0) {
             uint64_t mask[2] = {0x101010101010101, 0};
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate<int32_t>(statusTensor_, 0x3F800000, mask, CEIL(expertCntUp, 8), 1, 8);
+            AscendC::Duplicate<int32_t>(statusTensor_, GetCountOnlyStatusValue(), mask, CEIL(expertCntUp, 8), 1, 8);
         }
 
         AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
@@ -684,6 +758,17 @@ public:
             rankGMTensor.SetGlobalBuffer((__gm__ int32_t *)rankGM);
             AscendC::DataCopy<int32_t>(rankGMTensor, statusTensor_[rankIndex * 8], 8UL);
         }
+        AscendC::PipeBarrier<PIPE_MTE3>();
+
+        for (uint32_t curExpertId = startExpertId; curExpertId < endExpertId; ++curExpertId) {
+            if (curExpertId < sharedExpertRankNum) {
+                continue;
+            }
+            int32_t dstExpertId = curExpertId - sharedExpertRankNum;
+            WriteTokenOrderMetadataForExpert(dstExpertId);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        PublishTokenCountStatus(startExpertId, endExpertId);
     }
 
     CATLASS_DEVICE

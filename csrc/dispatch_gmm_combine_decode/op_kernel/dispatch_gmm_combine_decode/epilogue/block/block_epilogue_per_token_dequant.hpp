@@ -199,6 +199,35 @@ public:
                calcInfo.winDataSizeOffset_ + expertLocalId * calcInfo.expertPerSizeOnWin_ + rankId * OPT_RANK_OFFSET;
     }
 
+    CATLASS_DEVICE GM_ADDR GetWinStateAddrByRankId(const int32_t rankId)
+    {
+        return (GM_ADDR)((calcInfo.epRankId_ == rankId)
+                             ? calcInfo.epWinContext_->localWindowsExp
+                             : ((HcclRankRelationResV2 *)(calcInfo.epWinContext_->remoteRes[rankId].nextDevicePtr))
+                                   ->windowsExp) +
+               calcInfo.winStateDataOffset_;
+    }
+
+    CATLASS_DEVICE uint32_t GetTokenOrderMetadataIndex(uint32_t localExpertId, uint32_t srcRank,
+                                                       uint32_t localOrdinal)
+    {
+        return (localExpertId * calcInfo.epWorldSize_ + srcRank) * calcInfo.axisBS_ * calcInfo.axisK_ + localOrdinal;
+    }
+
+    CATLASS_DEVICE uint32_t GetSourceTokenId(uint32_t localExpertId, uint32_t srcRank, uint32_t localOrdinal)
+    {
+        AscendC::GlobalTensor<int32_t> tokenOrderMetadataTensor;
+        uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, srcRank, localOrdinal);
+        GM_ADDR metadataGM = GetWinStateAddrByRankId(calcInfo.epRankId_) +
+                             MoeDistributeCombineImpl::TOKEN_ORDER_METADATA_OFFSET +
+                             metadataIndex * sizeof(int32_t);
+        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ int32_t *)metadataGM);
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(
+            tokenOrderMetadataTensor[0]);
+        return static_cast<uint32_t>(tokenOrderMetadataTensor.GetValue(0));
+    }
+
     CATLASS_DEVICE void SetCombineSendEpRank(uint32_t epRank, uint32_t &remoteEpRank, uint32_t &localEpRank)
     {
         if ((calcInfo.isShardExpert_) && (epRank < calcInfo.sharedExpertRankNum_)) {
@@ -231,8 +260,6 @@ public:
             sendCount = epSendCountLocal_.GetValue(expertOffset + epRank);
             if (prevSendCount <= itToken && itToken < sendCount) {
                 uint32_t copyTokenCount = (sendCount < endToken ? sendCount : endToken) - itToken;
-                AscendC::DataCopyExtParams dataCopyParams(copyTokenCount, copyTokenLen, copyTokenSrcStride,
-                                                          copyTokenDstStride, 0);
                 uint32_t remoteEpRank;
                 uint32_t localEpRank;
                 SetCombineSendEpRank(epRank, remoteEpRank, localEpRank);
@@ -240,8 +267,16 @@ public:
                                  localEpRank * calcInfo.moeExpertPerRankNum_ * calcInfo.expertPerSizeOnWin_;
                 AscendC::GlobalTensor<ElementD> rankWindow;
                 rankWindow.SetGlobalBuffer((__gm__ ElementD *)rankGM);
-                AscendC::DataCopyPad(rankWindow[(itToken - prevSendCount) * calcInfo.axisH_ + tokenOffset],
-                                     ubD[(itToken - startToken) * layoutUbD.stride(0)], dataCopyParams);
+                AscendC::DataCopyExtParams dataCopyParams(1, copyTokenLen, copyTokenSrcStride, copyTokenDstStride, 0);
+                for (uint32_t tokenIdx = 0; tokenIdx < copyTokenCount; ++tokenIdx) {
+                    uint32_t localOrdinal = itToken + tokenIdx - prevSendCount;
+                    uint32_t dstToken = localOrdinal;
+                    if (!((calcInfo.isShardExpert_) && (epRank < calcInfo.sharedExpertRankNum_))) {
+                        dstToken = GetSourceTokenId(expertIdx, epRank, localOrdinal);
+                    }
+                    AscendC::DataCopyPad(rankWindow[dstToken * calcInfo.axisH_ + tokenOffset],
+                                         ubD[(itToken + tokenIdx - startToken) * layoutUbD.stride(0)], dataCopyParams);
+                }
                 itToken += copyTokenCount;
             }
         }

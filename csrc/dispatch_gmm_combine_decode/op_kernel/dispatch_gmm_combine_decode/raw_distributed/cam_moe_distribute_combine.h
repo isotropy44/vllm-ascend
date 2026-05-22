@@ -33,6 +33,7 @@ constexpr uint64_t WIN_STATE_OFFSET = 512 * 1024;
 constexpr uint64_t STATE_WIN_OFFSET = 900 * 1024;
 constexpr uint16_t SEND_SYNC_EVENT_ID = 9;
 constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
+constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = SELF_STATE_OFFSET + 8 * 1024;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncFunc()
@@ -51,11 +52,14 @@ struct CombineCalcInfo {
     uint32_t moeExpertPerRankNum_;
     uint32_t sharedExpertRankNum_;
     uint32_t axisH_;
+    uint32_t axisBS_;
+    uint32_t axisK_;
     uint32_t moeSendNum_;
     bool isShardExpert_;
     GM_ADDR epSendCount_;
     __gm__ HcclOpResParam *epWinContext_;
     uint64_t winDataSizeOffset_;
+    uint64_t winStateDataOffset_;
 };
 
 template <TemplateMC2TypeClass>
@@ -331,11 +335,14 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::Init(
     calcInfo_.moeExpertPerRankNum_ = moeExpertPerRankNum_;
     calcInfo_.sharedExpertRankNum_ = sharedExpertRankNum_;
     calcInfo_.axisH_ = axisH_;
+    calcInfo_.axisBS_ = axisBS_;
+    calcInfo_.axisK_ = axisK_;
     calcInfo_.moeSendNum_ = moeSendNum_;
     calcInfo_.isShardExpert_ = isShardExpert_;
     calcInfo_.epSendCount_ = epSendCount;
     calcInfo_.epWinContext_ = epWinContext_;
     calcInfo_.winDataSizeOffset_ = winDataSizeOffset_;
+    calcInfo_.winStateDataOffset_ = static_cast<uint64_t>(dataState_) * WIN_STATE_OFFSET;
 }
 
 template <TemplateMC2TypeClass>
@@ -721,7 +728,9 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::LocalWindow
     const DataCopyPadExtParams<ExpandIdxType> copyPadParams{false, 0U, 0U, 0U};
     const DataCopyPadExtParams<float> copyPadFloatParams{false, 0U, 0U, 0U};
 
-    DataCopyPad(indexCountsLocal, expandIdxGM_, bskParams, copyPadParams);
+    if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
+        DataCopyPad(indexCountsLocal, expandIdxGM_, bskParams, copyPadParams);
+    }
     DataCopyPad(expertIdsLocal, expertIdsGM_, bskParams, copyPadParams);
     DataCopyPad(expandScalesLocal, expandScalesGM_, bskParams, copyPadFloatParams);
     SyncFunc<AscendC::HardEvent::MTE2_S>();
@@ -737,9 +746,13 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::LocalWindow
                 continue;
             }
             float scaleVal = expandScalesLocal.GetValue(index);
+            uint32_t tokenSlot = tokenIndex;
+            if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
+                tokenSlot = static_cast<uint32_t>(indexCountsLocal.GetValue(index));
+            }
             GM_ADDR wAddr = (__gm__ uint8_t *)(epWindowGM_) +
                             expertPerSizeOnWin_ * moeExpertPerRankNum_ * sharedExpertRankNum_ +
-                            expertPerSizeOnWin_ * moeExpert + indexCountsLocal.GetValue(index) * axisHExpandXTypeSize_ +
+                            expertPerSizeOnWin_ * moeExpert + tokenSlot * axisHExpandXTypeSize_ +
                             tokenOffset * sizeof(ExpandXType);
             rowTmpGlobal_.SetGlobalBuffer((__gm__ ExpandXType *)wAddr);
             ExpandXType val = rowTmpGlobal_.GetValue(0);
