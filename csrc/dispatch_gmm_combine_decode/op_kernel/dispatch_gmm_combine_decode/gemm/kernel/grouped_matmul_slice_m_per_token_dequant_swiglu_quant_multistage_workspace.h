@@ -25,6 +25,7 @@
 namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = SELF_STATE_OFFSET + 8 * 1024;
+using TokenOrderMetadataType = uint8_t;
 
 template <class ArchTag>
 class BlockQuant
@@ -628,14 +629,14 @@ public:
     CATLASS_DEVICE
     void WriteTokenOrderMetadata(uint32_t dstRankId, uint32_t localExpertId, uint32_t localOrdinal, uint32_t srcTokenId)
     {
-        AscendC::GlobalTensor<int32_t> tokenOrderMetadataTensor;
+        AscendC::GlobalTensor<TokenOrderMetadataType> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, epRankId, localOrdinal);
         GM_ADDR metadataGM = GET_WIND_STATE_ADDR_BY_RANK_ID(dstRankId) + TOKEN_ORDER_METADATA_OFFSET +
-                             metadataIndex * sizeof(int32_t);
-        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ int32_t *)metadataGM);
-        tokenOrderMetadataTensor.SetValue(0, static_cast<int32_t>(srcTokenId));
+                             metadataIndex * sizeof(TokenOrderMetadataType);
+        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ TokenOrderMetadataType *)metadataGM);
+        tokenOrderMetadataTensor.SetValue(0, static_cast<TokenOrderMetadataType>(srcTokenId));
         __asm__ __volatile__("");
-        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DataCacheCleanAndInvalid<TokenOrderMetadataType, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(
             tokenOrderMetadataTensor[0]);
         __asm__ __volatile__("");

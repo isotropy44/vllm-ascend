@@ -216,13 +216,13 @@ public:
 
     CATLASS_DEVICE uint32_t GetSourceTokenId(uint32_t localExpertId, uint32_t srcRank, uint32_t localOrdinal)
     {
-        AscendC::GlobalTensor<int32_t> tokenOrderMetadataTensor;
+        AscendC::GlobalTensor<uint8_t> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, srcRank, localOrdinal);
         GM_ADDR metadataGM = GetWinStateAddrByRankId(calcInfo.epRankId_) +
                              MoeDistributeCombineImpl::TOKEN_ORDER_METADATA_OFFSET +
-                             metadataIndex * sizeof(int32_t);
-        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ int32_t *)metadataGM);
-        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                             metadataIndex * sizeof(uint8_t);
+        tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ uint8_t *)metadataGM);
+        AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(
             tokenOrderMetadataTensor[0]);
         return static_cast<uint32_t>(tokenOrderMetadataTensor.GetValue(0));
