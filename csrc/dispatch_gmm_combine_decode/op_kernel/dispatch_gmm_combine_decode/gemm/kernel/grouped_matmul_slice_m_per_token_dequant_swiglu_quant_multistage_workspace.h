@@ -1491,24 +1491,27 @@ public:
                 uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
                 GemmCoord blockShapeMNK = L1TileShape::ToCoord();
-                for (uint32_t loopIdx = compCoreIdx; loopIdx < coreLoops; loopIdx += compCoreNum) {
-                    GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
-                    GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
-
-                    uint32_t producerAicIdx = (startCoreIdx + loopIdx) % aicNum;
+                for (uint32_t producerAicIdx = compCoreIdx; producerAicIdx < aicNum;
+                     producerAicIdx += compCoreNum) {
                     uint32_t producerStartLoopIdx =
                         (producerAicIdx + aicNum - startCoreIdx) % aicNum;
-                    uint32_t producerLoopOrder = (loopIdx - producerStartLoopIdx) / aicNum;
-                    uint32_t producerStageId = producerLoopOrder % WORKSPACE_STAGES;
-                    MatrixCoord offsetC{(producerStageId * aicNum + producerAicIdx) * L1TileShape::M, 0};
-                    int64_t gmOffsetC = layoutC.GetOffset(offsetC);
-                    auto gmBlockC = gmC[gmOffsetC];
-                    auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
-                    CheckSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET,
-                        static_cast<uint8_t>(aicNum + producerAicIdx), producerLoopOrder + 1);
-                    blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
-                    PublishQuantReadyFlags(expertRowBase, blockCoordMNK, actualBlockShapeMNK);
-                    EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(producerAicIdx));
+                    uint32_t producerLoopOrder = 0;
+                    for (uint32_t loopIdx = producerStartLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
+                        GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
+                        GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
+
+                        uint32_t producerStageId = producerLoopOrder % WORKSPACE_STAGES;
+                        MatrixCoord offsetC{(producerStageId * aicNum + producerAicIdx) * L1TileShape::M, 0};
+                        int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+                        auto gmBlockC = gmC[gmOffsetC];
+                        auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
+                        CheckSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET,
+                            static_cast<uint8_t>(aicNum + producerAicIdx), producerLoopOrder + 1);
+                        blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
+                        PublishQuantReadyFlags(expertRowBase, blockCoordMNK, actualBlockShapeMNK);
+                        EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(producerAicIdx));
+                        producerLoopOrder += 1;
+                    }
                 }
 
                 if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
