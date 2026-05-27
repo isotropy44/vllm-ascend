@@ -33,7 +33,7 @@ constexpr uint64_t WIN_STATE_OFFSET = 512 * 1024;
 constexpr uint64_t STATE_WIN_OFFSET = 900 * 1024;
 constexpr uint16_t SEND_SYNC_EVENT_ID = 9;
 constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
-constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = SELF_STATE_OFFSET + 8 * 1024;
+constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncFunc()
@@ -59,7 +59,6 @@ struct CombineCalcInfo {
     GM_ADDR epSendCount_;
     __gm__ HcclOpResParam *epWinContext_;
     uint64_t winDataSizeOffset_;
-    uint64_t winStateDataOffset_;
 };
 
 template <TemplateMC2TypeClass>
@@ -342,7 +341,6 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::Init(
     calcInfo_.epSendCount_ = epSendCount;
     calcInfo_.epWinContext_ = epWinContext_;
     calcInfo_.winDataSizeOffset_ = winDataSizeOffset_;
-    calcInfo_.winStateDataOffset_ = static_cast<uint64_t>(dataState_) * WIN_STATE_OFFSET;
 }
 
 template <TemplateMC2TypeClass>

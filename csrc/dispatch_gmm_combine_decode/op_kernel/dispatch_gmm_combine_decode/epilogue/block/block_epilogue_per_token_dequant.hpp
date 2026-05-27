@@ -199,13 +199,12 @@ public:
                calcInfo.winDataSizeOffset_ + expertLocalId * calcInfo.expertPerSizeOnWin_ + rankId * OPT_RANK_OFFSET;
     }
 
-    CATLASS_DEVICE GM_ADDR GetWinStateAddrByRankId(const int32_t rankId)
+    CATLASS_DEVICE GM_ADDR GetWinStateBaseAddrByRankId(const int32_t rankId)
     {
         return (GM_ADDR)((calcInfo.epRankId_ == rankId)
                              ? calcInfo.epWinContext_->localWindowsExp
                              : ((HcclRankRelationResV2 *)(calcInfo.epWinContext_->remoteRes[rankId].nextDevicePtr))
-                                   ->windowsExp) +
-               calcInfo.winStateDataOffset_;
+                                   ->windowsExp);
     }
 
     CATLASS_DEVICE uint32_t GetTokenOrderMetadataIndex(uint32_t localExpertId, uint32_t srcRank,
@@ -218,7 +217,7 @@ public:
     {
         AscendC::GlobalTensor<uint8_t> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, srcRank, localOrdinal);
-        GM_ADDR metadataGM = GetWinStateAddrByRankId(calcInfo.epRankId_) +
+        GM_ADDR metadataGM = GetWinStateBaseAddrByRankId(calcInfo.epRankId_) +
                              MoeDistributeCombineImpl::TOKEN_ORDER_METADATA_OFFSET +
                              metadataIndex * sizeof(uint8_t);
         tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ uint8_t *)metadataGM);

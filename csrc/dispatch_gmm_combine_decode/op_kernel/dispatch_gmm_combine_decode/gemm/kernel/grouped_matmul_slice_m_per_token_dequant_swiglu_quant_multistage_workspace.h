@@ -24,7 +24,7 @@
 
 namespace Catlass::Gemm::Kernel {
 
-constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = SELF_STATE_OFFSET + 8 * 1024;
+constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
 using TokenOrderMetadataType = uint8_t;
 
 template <class ArchTag>
@@ -627,11 +627,19 @@ public:
     }
 
     CATLASS_DEVICE
+    GM_ADDR GetWinStateBaseAddrByRankId(const int32_t rankId)
+    {
+        return (GM_ADDR)((epRankId == rankId)
+                             ? winContext_->localWindowsExp
+                             : ((HcclRankRelationResV2 *)(winContext_->remoteRes[rankId].nextDevicePtr))->windowsExp);
+    }
+
+    CATLASS_DEVICE
     void WriteTokenOrderMetadata(uint32_t dstRankId, uint32_t localExpertId, uint32_t localOrdinal, uint32_t srcTokenId)
     {
         AscendC::GlobalTensor<TokenOrderMetadataType> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, epRankId, localOrdinal);
-        GM_ADDR metadataGM = GET_WIND_STATE_ADDR_BY_RANK_ID(dstRankId) + TOKEN_ORDER_METADATA_OFFSET +
+        GM_ADDR metadataGM = GetWinStateBaseAddrByRankId(dstRankId) + TOKEN_ORDER_METADATA_OFFSET +
                              metadataIndex * sizeof(TokenOrderMetadataType);
         tokenOrderMetadataTensor.SetGlobalBuffer((__gm__ TokenOrderMetadataType *)metadataGM);
         tokenOrderMetadataTensor.SetValue(0, static_cast<TokenOrderMetadataType>(srcTokenId));
