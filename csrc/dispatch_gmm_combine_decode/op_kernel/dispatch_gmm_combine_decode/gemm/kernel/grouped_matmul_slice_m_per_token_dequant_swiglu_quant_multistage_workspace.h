@@ -25,6 +25,8 @@
 namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
+constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = 256 * 1024;
+constexpr uint32_t PIPELINE_QUANT_ROW_ONCE = 1;
 using TokenOrderMetadataType = uint8_t;
 
 template <class ArchTag>
@@ -400,6 +402,73 @@ public:
     template <int32_t CORE_TYPE = g_coreType>
     CATLASS_DEVICE void operator()(Params const &params);
 
+    CATLASS_DEVICE
+    uint32_t MaxU32(uint32_t a, uint32_t b) const
+    {
+        return a > b ? a : b;
+    }
+
+    CATLASS_DEVICE
+    uint32_t MinU32(uint32_t a, uint32_t b) const
+    {
+        return a < b ? a : b;
+    }
+
+    CATLASS_DEVICE
+    uint32_t CeilDivU32(uint32_t x, uint32_t y) const
+    {
+        return (x + y - 1) / y;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetPlannedRecvCompCoreNum(uint32_t coreNum) const
+    {
+        if (localExpertNum <= 1) {
+            return coreNum * subBlockNum;
+        }
+        uint32_t halfCoreNum = coreNum / ODD_EVEN_BASE;
+        return MinU32(coreNum, MaxU32(localExpertNum, halfCoreNum));
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetExpertCoreBegin(uint32_t expertIdx, uint32_t coreNum) const
+    {
+        return expertIdx * coreNum / localExpertNum;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetExpertCoreEnd(uint32_t expertIdx, uint32_t coreNum) const
+    {
+        return (expertIdx + 1) * coreNum / localExpertNum;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetRecvCompCoreCount(uint32_t expertIdx) const
+    {
+        return GetExpertCoreEnd(expertIdx, recvCompCoreNum) - GetExpertCoreBegin(expertIdx, recvCompCoreNum);
+    }
+
+    CATLASS_DEVICE
+    bool IsQuantPipelineWorkspaceEnough(Params const &params) const
+    {
+        uint32_t expectedNTiles = CeilDivU32(params.problemShape.n(), L1TileShape::N);
+        uint64_t flagCount = static_cast<uint64_t>(params.problemShape.m()) * expectedNTiles;
+        return flagCount * UB_ALIGN <= DYNAMIC_QUANT_READY_WORKSPACE_SIZE;
+    }
+
+    CATLASS_DEVICE
+    bool ShouldEnableQuantPipeline(Params const &params) const
+    {
+        if (localExpertNum <= 1) {
+            return false;
+        }
+        uint32_t plannedRecvCompCoreNum = GetPlannedRecvCompCoreNum(aiCoreGroupNum);
+        if (plannedRecvCompCoreNum >= aiCoreGroupNum) {
+            return false;
+        }
+        return IsQuantPipelineWorkspaceEnough(params);
+    }
+
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const &params)
     {
@@ -418,7 +487,8 @@ public:
         if (localExpertNum > 1) {
             recvCoreNum = aiCoreGroupNum;
         }
-        uint32_t coreNumPerGroup = recvCoreNum / localExpertNum;
+        enableQuantPipeline = ShouldEnableQuantPipeline(params);
+        recvCompCoreNum = enableQuantPipeline ? GetPlannedRecvCompCoreNum(aiCoreGroupNum) : recvCoreNum;
         winContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
 
         // state of cv flag
@@ -481,7 +551,7 @@ public:
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
                     break;
                 }
             }
@@ -1224,18 +1294,37 @@ public:
     }
 
     CATLASS_DEVICE
+    bool GetRecvCompAssignment(uint32_t coreIdx, uint32_t &groupId, uint32_t &coreIdxInGroup,
+                               uint32_t &coreNumInGroup) const
+    {
+        for (uint32_t expertIdx = 0; expertIdx < localExpertNum; ++expertIdx) {
+            uint32_t coreBegin = GetExpertCoreBegin(expertIdx, recvCompCoreNum);
+            uint32_t coreEnd = GetExpertCoreEnd(expertIdx, recvCompCoreNum);
+            if (coreIdx >= coreBegin && coreIdx < coreEnd) {
+                groupId = expertIdx;
+                coreIdxInGroup = coreIdx - coreBegin;
+                coreNumInGroup = coreEnd - coreBegin;
+                return coreNumInGroup > 0;
+            }
+        }
+        return false;
+    }
+
+    CATLASS_DEVICE
     void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount)
     {
         ubOffset = 0;
         RecvCount(ubOffset);
 
         uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
-        uint32_t recvCoreNumPerGroup = recvCoreNum / localExpertNum;
+        uint32_t groupId = 0;
+        uint32_t recvCoreIdxInGroup = 0;
+        uint32_t recvCoreNumPerGroup = 0;
+        if (!GetRecvCompAssignment(recvCompCoreIdx, groupId, recvCoreIdxInGroup, recvCoreNumPerGroup)) {
+            return;
+        }
         uint32_t recvRankNumPerCore = epRankSize / recvCoreNumPerGroup;
         uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
-
-        uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;
-        uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;
         uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;
         if (recvCoreIdxInGroup < remainderRankNum) {
             recvRankNumPerCore += 1;
@@ -1274,14 +1363,79 @@ public:
     }
 
     CATLASS_DEVICE
+    void StoreQuantReadyFlag(uint32_t flagIdx, uint32_t value)
+    {
+        AscendC::GlobalTensor<uint32_t> flagTensor;
+        flagTensor.SetGlobalBuffer((__gm__ uint32_t *)(quantReadyBase + flagIdx * UB_ALIGN));
+        flagTensor.SetValue(0, value);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(flagTensor[0]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    uint32_t LoadQuantReadyFlag(uint32_t flagIdx)
+    {
+        AscendC::GlobalTensor<uint32_t> flagTensor;
+        flagTensor.SetGlobalBuffer((__gm__ uint32_t *)(quantReadyBase + flagIdx * UB_ALIGN));
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(flagTensor[0]);
+        __asm__ __volatile__("");
+        return flagTensor.GetValue(0);
+    }
+
+    CATLASS_DEVICE
+    void ClearQuantReadyFlags()
+    {
+        for (uint32_t flagIdx = aivIdx; flagIdx < quantReadyFlagCount; flagIdx += aivNum) {
+            StoreQuantReadyFlag(flagIdx, 0);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
+    void PublishQuantReadyFlags(uint32_t expertRowBase, GemmCoord const &blockCoordMNK,
+                                GemmCoord const &actualBlockShapeMNK)
+    {
+        if (!enableQuantPipeline) {
+            return;
+        }
+        uint32_t rowCount = actualBlockShapeMNK.m();
+        if (rowCount == 0) {
+            return;
+        }
+        uint32_t globalRowStart = expertRowBase + blockCoordMNK.m() * L1TileShape::M;
+        uint32_t nTileId = blockCoordMNK.n();
+        for (uint32_t rowOffset = 0; rowOffset < rowCount; ++rowOffset) {
+            uint32_t quantTileId = globalRowStart + rowOffset;
+            uint32_t flagIdx = quantTileId * quantExpectedNTiles + nTileId;
+            StoreQuantReadyFlag(flagIdx, quantEpoch);
+        }
+    }
+
+    CATLASS_DEVICE
+    void WaitQuantReadyTile(uint32_t quantTileId)
+    {
+        for (uint32_t nTileId = 0; nTileId < quantExpectedNTiles; ++nTileId) {
+            uint32_t flagIdx = quantTileId * quantExpectedNTiles + nTileId;
+            while (LoadQuantReadyFlag(flagIdx) != quantEpoch) {
+                __asm__ __volatile__("");
+            }
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
     void CompCoreFunc(GM_ADDR gmCVSwapBuff, __gm__ ElementScale *gmScale, __gm__ ElementPerTokenScale *gmTokenScale,
                     __gm__ float *gmSwigluOutput, uint32_t n, uint32_t k, LayoutScale layoutScale,
                     LayoutPerTokenScale wholeLayoutPerTokenScale, LayoutOutput layoutOutput)
     {
-        uint32_t coreNumPerGroup = recvCoreNum / localExpertNum;
         int64_t gmGroupOffsetScale = 0;
         int64_t gmGroupOffsetPerTokenScale = 0;
         int64_t gmGroupOffsetD = 0;
+        uint32_t expertRowBase = 0;
 
         AscendC::GlobalTensor<ElementC> gmC;
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(gmCVSwapBuff));
@@ -1290,8 +1444,6 @@ public:
             BlockScheduler blockScheduler;
             BlockEpilogue blockEpilogue(resource);
 
-            uint32_t stageId = 0;
-            uint32_t target = 1;
             uint32_t startCoreIdx = 0;
             AscendC::ListTensorDesc gmScaleListTensor;
             AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
@@ -1309,7 +1461,7 @@ public:
                     AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                     AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                     __asm__ __volatile__("");
-                    if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                    if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
                         break;
                     }
                 }
@@ -1339,22 +1491,24 @@ public:
                 uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
                 GemmCoord blockShapeMNK = L1TileShape::ToCoord();
-                uint32_t startLoopIdx =
-                    ((compCoreIdx < startCoreIdx) ? (compCoreIdx + aiCoreGroupNum) : compCoreIdx) - startCoreIdx;
-                for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aiCoreGroupNum) {
+                for (uint32_t loopIdx = compCoreIdx; loopIdx < coreLoops; loopIdx += compCoreNum) {
                     GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
                     GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
 
-                    MatrixCoord offsetC{(stageId * aiCoreGroupNum + aiCoreGroupIdx) * L1TileShape::M, 0};
+                    uint32_t producerAicIdx = (startCoreIdx + loopIdx) % aicNum;
+                    uint32_t producerStartLoopIdx =
+                        (producerAicIdx + aicNum - startCoreIdx) % aicNum;
+                    uint32_t producerLoopOrder = (loopIdx - producerStartLoopIdx) / aicNum;
+                    uint32_t producerStageId = producerLoopOrder % WORKSPACE_STAGES;
+                    MatrixCoord offsetC{(producerStageId * aicNum + producerAicIdx) * L1TileShape::M, 0};
                     int64_t gmOffsetC = layoutC.GetOffset(offsetC);
                     auto gmBlockC = gmC[gmOffsetC];
                     auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
                     CheckSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET,
-                        static_cast<uint8_t>(compCoreNum + compCoreIdx), target);
-                    target += 1;
+                        static_cast<uint8_t>(aicNum + producerAicIdx), producerLoopOrder + 1);
                     blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
-                    EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(compCoreIdx));
-                    stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+                    PublishQuantReadyFlags(expertRowBase, blockCoordMNK, actualBlockShapeMNK);
+                    EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(producerAicIdx));
                 }
 
                 if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
@@ -1362,6 +1516,7 @@ public:
                 }
                 gmGroupOffsetPerTokenScale += inGroupProblemShape.m();
                 gmGroupOffsetD += currentM * n;
+                expertRowBase += currentM;
 
                 startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
             }
@@ -1374,10 +1529,10 @@ public:
         AscendC::Duplicate(tmpZeroLocalTensor, (int32_t)0, INT32_COUNT_PER_BLOCK);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-        AscendC::DataCopy(softSyncTensor[compCoreIdx * SOFT_SYNC_SPACE_SIZE / sizeof(int32_t)], tmpZeroLocalTensor,
-                        INT32_COUNT_PER_BLOCK);
-        AscendC::DataCopy(softSyncTensor[(compCoreIdx + compCoreNum) * SOFT_SYNC_SPACE_SIZE / sizeof(int32_t)],
-                        tmpZeroLocalTensor, INT32_COUNT_PER_BLOCK);
+        for (uint32_t flagIdx = compCoreIdx; flagIdx < aicNum * 2; flagIdx += compCoreNum) {
+            AscendC::DataCopy(softSyncTensor[flagIdx * SOFT_SYNC_SPACE_SIZE / sizeof(int32_t)], tmpZeroLocalTensor,
+                            INT32_COUNT_PER_BLOCK);
+        }
     }
 
     CATLASS_DEVICE
@@ -1389,6 +1544,7 @@ public:
         aivNum = aiCoreGroupNum * subBlockNum;
         aivIdx = AscendC::GetBlockIdx();
         aiCoreGroupIdx = aivIdx / subBlockNum;
+        recvPoolIdx = aiCoreGroupIdx;
         aivStateGlobalCoreIdx = aivNum + aicNum + aivIdx;
 
         isCompCore = (aivIdx % subBlockNum) == 0;
@@ -1423,6 +1579,24 @@ public:
             sendCoreNum = aiCoreGroupNum;
             recvCoreNum = aiCoreGroupNum;
         }
+        enableQuantPipeline = ShouldEnableQuantPipeline(params);
+        recvCompCoreNum = recvCoreNum;
+        recvCompCoreIdx = recvCoreIdx;
+        isRecvCompCore = isRecvCore;
+        if (enableQuantPipeline) {
+            recvCompCoreNum = GetPlannedRecvCompCoreNum(aiCoreGroupNum);
+            quantCoreNum = aiCoreGroupNum - recvCompCoreNum;
+            isRecvCompCore = isRecvCore && recvPoolIdx < recvCompCoreNum;
+            isQuantCore = isRecvCore && recvPoolIdx >= recvCompCoreNum;
+            recvCompCoreIdx = recvPoolIdx;
+            quantCoreIdx = isQuantCore ? (recvPoolIdx - recvCompCoreNum) : 0;
+            isCompCore = isRecvCompCore;
+            compCoreNum = recvCompCoreNum;
+            compCoreIdx = recvCompCoreIdx;
+        } else {
+            quantCoreNum = 0;
+            isQuantCore = false;
+        }
 
         hOutSize = tokenLength * sizeof(int8_t);
         scaleParamPad = TOKEN_EXTRA_SPACE;  // 512B for dynamic quant scale
@@ -1437,6 +1611,27 @@ public:
         expertPerSizeOnWin = maxAxisBs * tokenLength * sizeof(XType);
         winContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
         statusDataSpaceGm = (GM_ADDR)(winContext_->localWindowsExp);
+        quantReadyBase = params.gmResvered;
+        quantExpectedNTiles = CeilDivU32(params.problemShape.n(), L1TileShape::N);
+        quantReadyFlagCount = params.problemShape.m() * quantExpectedNTiles;
+        quantReadyWorkspaceBytes = quantReadyFlagCount * UB_ALIGN;
+    }
+
+    CATLASS_DEVICE
+    void PrintQuantPipelineFallback(Params const &params)
+    {
+        if (aivIdx != 0 || localExpertNum <= 1 || enableQuantPipeline) {
+            return;
+        }
+        uint32_t plannedRecvCompCoreNum = GetPlannedRecvCompCoreNum(aiCoreGroupNum);
+        if (plannedRecvCompCoreNum >= aiCoreGroupNum) {
+            printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: quantCoreNum=0, use legacy post SyncAll quant\n");
+            return;
+        }
+        if (!IsQuantPipelineWorkspaceEnough(params)) {
+            printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: ready flag workspace overflow, required=%u bytes, limit=262144 bytes, use legacy post SyncAll quant\n",
+                   quantReadyWorkspaceBytes);
+        }
     }
 
     CATLASS_DEVICE
@@ -1501,6 +1696,7 @@ public:
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(
             selfStatusTensor[aivIdx * UB_ALIGN]);
         __asm__ __volatile__("");
+        quantEpoch = static_cast<uint32_t>(dataState + 1);
     }
 
     CATLASS_DEVICE
@@ -1517,7 +1713,7 @@ public:
             AscendC::DataCopy(groupTokenNumStateTensor, tmpZeroLocalTensor, GROUP_INFO_SIZE * localExpertNum);
         }
 
-        if (isRecvCore && recvCoreIdx == (recvCoreNum - 1)) {
+        if (isRecvCompCore && recvCompCoreIdx == (recvCompCoreNum - 1)) {
             // record token count for each local expert
             AscendC::GlobalTensor<int64_t> expertTokenNumsOutGMTensor_;
             expertTokenNumsOutGMTensor_.SetGlobalBuffer((__gm__ int64_t *)(ptrGroupList));
@@ -1553,60 +1749,137 @@ public:
         }
     }
 
+    CATLASS_DEVICE
+    void WaitRecvCompGroup(uint32_t groupIdx)
+    {
+        AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
+        groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
+                                                groupIdx * GROUP_INFO_SIZE);
+        uint32_t target = GetRecvCompCoreCount(groupIdx) * vToCFlag;
+        while (true) {
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                            AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
+            __asm__ __volatile__("");
+            if (groupTokenNumStateTensor.GetValue(0) == target) {
+                break;
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void WaitAllRecvCompGroups()
+    {
+        for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
+            WaitRecvCompGroup(groupIdx);
+        }
+    }
+
+    CATLASS_DEVICE
+    uint32_t LoadTotalTokenCount(GM_ADDR gmEpSendCount)
+    {
+        AscendC::GlobalTensor<int32_t> sendCountsGlobal;
+        sendCountsGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(gmEpSendCount));
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                        AscendC::DcciDst::CACHELINE_OUT>(sendCountsGlobal);
+        __asm__ __volatile__("");
+        return sendCountsGlobal.GetValue(localExpertNum * epRankSize - 1);
+    }
+
+    CATLASS_DEVICE
+    void RunLegacyDynamicQuant(Params const &params, __gm__ float *gmSwigluOutput)
+    {
+        totalTokenCount = LoadTotalTokenCount(params.gmEpSendCount);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        uint32_t n = params.problemShape.n();
+        uint32_t nOut = params.problemShape.n() / 2;
+        uint32_t quantRowOnce = 0;
+        CalQuantRow(nOut, quantRowOnce);
+        auto swigluLayout = layout::RowMajor{totalTokenCount, n};
+        typename BlockQuant<ArchTag>::Params quantParams{
+            gmSwigluOutput,   swigluLayout,        params.ptrDequantScale, params.layoutDequantScale,
+            params.ptrOutput, params.layoutOutput, quantRowOnce,           nOut};
+
+        BlockQuant<ArchTag> blockQuant(resource, quantParams);
+        MatrixCoord quantShape(totalTokenCount, nOut);
+        MatrixCoord quantBlockShape((uint16_t)(subBlockNum * quantRowOnce), nOut);
+        Epilogue::Tile::EpilogueHorizontalTileSwizzle quantSwizzle(quantShape, quantBlockShape);
+        for (uint32_t loopIdx = aiCoreGroupIdx; loopIdx < quantSwizzle.GetLoops(); loopIdx += aiCoreGroupNum) {
+            auto blockCoord = quantSwizzle.GetTileCoord(loopIdx);
+            auto actualBlockShape = quantSwizzle.GetActualTileShape(blockCoord);
+            blockQuant(quantBlockShape, blockCoord, actualBlockShape);
+        }
+    }
+
+    CATLASS_DEVICE
+    void RunPipelinedDynamicQuant(Params const &params, __gm__ float *gmSwigluOutput)
+    {
+        WaitAllRecvCompGroups();
+        totalTokenCount = LoadTotalTokenCount(params.gmEpSendCount);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        uint32_t n = params.problemShape.n();
+        uint32_t nOut = params.problemShape.n() / 2;
+        auto swigluLayout = layout::RowMajor{totalTokenCount, n};
+        typename BlockQuant<ArchTag>::Params quantParams{
+            gmSwigluOutput,   swigluLayout,        params.ptrDequantScale, params.layoutDequantScale,
+            params.ptrOutput, params.layoutOutput, PIPELINE_QUANT_ROW_ONCE, nOut};
+
+        BlockQuant<ArchTag> blockQuant(resource, quantParams);
+        MatrixCoord quantBlockShape(PIPELINE_QUANT_ROW_ONCE, nOut);
+        for (uint32_t quantTileId = quantCoreIdx; quantTileId < totalTokenCount; quantTileId += quantCoreNum) {
+            WaitQuantReadyTile(quantTileId);
+            MatrixCoord blockCoord(quantTileId, 0);
+            MatrixCoord actualBlockShape(PIPELINE_QUANT_ROW_ONCE, nOut);
+            blockQuant(quantBlockShape, blockCoord, actualBlockShape);
+        }
+    }
+
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIV>(Params const &params)
     {
         AivInitParams(params);
         AivInitState();
+        PrintQuantPipelineFallback(params);
+        if (enableQuantPipeline) {
+            ClearQuantReadyFlags();
+            AscendC::SyncAll<false>();
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
         if (isSendCore) {
             SendCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
                         (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx, (GM_ADDR)params.gmXActiveMask);
         }
-        if (isRecvCore) {
+        if (isRecvCompCore) {
             RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount);
         }
 
         auto gmSwigluOutput = reinterpret_cast<__gm__ float *>(
             params.ptrWorkspace + sizeof(int32_t) * (L1TileShape::M * aiCoreGroupNum * WORKSPACE_STAGES * L1TileShape::N));
-        if (isCompCore) {
-            CompCoreFunc(params.ptrWorkspace, params.ptrScale, params.ptrPerTokenScale, gmSwigluOutput,
-                        params.problemShape.n(), params.problemShape.k(), params.layoutScale, params.layoutPerTokenScale,
-                        params.layoutOutput);
-        }
-
-        icache_preload(8);
-        AscendC::SyncAll<false>();
-        AscendC::PipeBarrier<PIPE_ALL>();
-
-        UpdateAndCleanInfo(params.ptrGroupList, params.gmEpSendCount, params.gmExpertTokenNums);
-        {
-            // dynamic quant
-            AscendC::GlobalTensor<int32_t> sendCountsGlobal;
-            sendCountsGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.gmEpSendCount));
-            __asm__ __volatile__("");
-            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                            AscendC::DcciDst::CACHELINE_OUT>(sendCountsGlobal);
-            __asm__ __volatile__("");
-            totalTokenCount = sendCountsGlobal.GetValue(localExpertNum * epRankSize - 1);
-            AscendC::PipeBarrier<PIPE_ALL>();
-            uint32_t n = params.problemShape.n();
-            uint32_t nOut = params.problemShape.n() / 2;
-            uint32_t quantRowOnce = 0;
-            CalQuantRow(nOut, quantRowOnce);
-            auto swigluLayout = layout::RowMajor{totalTokenCount, n};
-            typename BlockQuant<ArchTag>::Params quantParams{
-                gmSwigluOutput,   swigluLayout,        params.ptrDequantScale, params.layoutDequantScale,
-                params.ptrOutput, params.layoutOutput, quantRowOnce,           nOut};
-
-            BlockQuant<ArchTag> blockQuant(resource, quantParams);
-            MatrixCoord quantShape(totalTokenCount, nOut);
-            MatrixCoord quantBlockShape((uint16_t)(subBlockNum * quantRowOnce), nOut);
-            Epilogue::Tile::EpilogueHorizontalTileSwizzle quantSwizzle(quantShape, quantBlockShape);
-            for (uint32_t loopIdx = aiCoreGroupIdx; loopIdx < quantSwizzle.GetLoops(); loopIdx += aiCoreGroupNum) {
-                auto blockCoord = quantSwizzle.GetTileCoord(loopIdx);
-                auto actualBlockShape = quantSwizzle.GetActualTileShape(blockCoord);
-                blockQuant(quantBlockShape, blockCoord, actualBlockShape);
+        if (enableQuantPipeline) {
+            if (isCompCore) {
+                CompCoreFunc(params.ptrWorkspace, params.ptrScale, params.ptrPerTokenScale, gmSwigluOutput,
+                            params.problemShape.n(), params.problemShape.k(), params.layoutScale,
+                            params.layoutPerTokenScale, params.layoutOutput);
             }
+            if (isQuantCore) {
+                RunPipelinedDynamicQuant(params, gmSwigluOutput);
+            }
+            icache_preload(8);
+            AscendC::SyncAll<false>();
+            AscendC::PipeBarrier<PIPE_ALL>();
+            UpdateAndCleanInfo(params.ptrGroupList, params.gmEpSendCount, params.gmExpertTokenNums);
+        } else {
+            if (isCompCore) {
+                CompCoreFunc(params.ptrWorkspace, params.ptrScale, params.ptrPerTokenScale, gmSwigluOutput,
+                            params.problemShape.n(), params.problemShape.k(), params.layoutScale,
+                            params.layoutPerTokenScale, params.layoutOutput);
+            }
+            icache_preload(8);
+            AscendC::SyncAll<false>();
+            AscendC::PipeBarrier<PIPE_ALL>();
+            UpdateAndCleanInfo(params.ptrGroupList, params.gmEpSendCount, params.gmExpertTokenNums);
+            RunLegacyDynamicQuant(params, gmSwigluOutput);
         }
     }
 
@@ -1693,6 +1966,9 @@ private:
     bool isSendCore{false};
     bool isRecvCore{false};
     bool isCompCore{false};  // calculate deq_swiglu
+    bool isRecvCompCore{false};
+    bool isQuantCore{false};
+    bool enableQuantPipeline{false};
     uint32_t aiCoreGroupNum{0};
     uint32_t aiCoreGroupIdx{0};
     uint32_t subBlockNum{0};
@@ -1701,15 +1977,25 @@ private:
     uint32_t sendCoreNum{0};
     uint32_t recvCoreNum{0};
     uint32_t compCoreNum{0};
+    uint32_t recvCompCoreNum{0};
+    uint32_t quantCoreNum{0};
     uint32_t aivIdx{0};
     uint32_t aicIdx{0};
     uint32_t sendCoreIdx{0};
     uint32_t recvCoreIdx{0};
     uint32_t compCoreIdx{0};
+    uint32_t recvPoolIdx{0};
+    uint32_t recvCompCoreIdx{0};
+    uint32_t quantCoreIdx{0};
     uint32_t aivStateGlobalCoreIdx{0};
     uint32_t aicStateGlobalCoreIdx{0};
     uint32_t sendToMoeAivNum{0};
     uint32_t sendToShareAivNum{0};
+    GM_ADDR quantReadyBase{0};
+    uint32_t quantExpectedNTiles{0};
+    uint32_t quantReadyFlagCount{0};
+    uint32_t quantReadyWorkspaceBytes{0};
+    uint32_t quantEpoch{0};
 };
 
 }  // namespace Catlass::Gemm::Kernel
