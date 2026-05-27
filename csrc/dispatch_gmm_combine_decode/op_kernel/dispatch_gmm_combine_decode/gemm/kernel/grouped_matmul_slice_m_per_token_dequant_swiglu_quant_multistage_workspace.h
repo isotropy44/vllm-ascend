@@ -1432,11 +1432,6 @@ public:
                     __gm__ float *gmSwigluOutput, uint32_t n, uint32_t k, LayoutScale layoutScale,
                     LayoutPerTokenScale wholeLayoutPerTokenScale, LayoutOutput layoutOutput)
     {
-        int64_t gmGroupOffsetScale = 0;
-        int64_t gmGroupOffsetPerTokenScale = 0;
-        int64_t gmGroupOffsetD = 0;
-        uint32_t expertRowBase = 0;
-
         AscendC::GlobalTensor<ElementC> gmC;
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(gmCVSwapBuff));
         auto layoutC = layout::RowMajor{L1TileShape::M * aiCoreGroupNum * WORKSPACE_STAGES, L1TileShape::N};
@@ -1448,54 +1443,63 @@ public:
             AscendC::ListTensorDesc gmScaleListTensor;
             AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
             gmScaleListTensor = AscendC::ListTensorDesc(reinterpret_cast<__gm__ void *>(gmScale));
-            __gm__ ElementScale* gmScalePtr;
-            if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
-                gmScalePtr = reinterpret_cast<__gm__ ElementScale*>(gmScaleListTensor.GetDataPtr<int32_t>(0));
-            }
-            for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
-                // just like AIC
-                groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
-                                                        groupIdx * GROUP_INFO_SIZE);
-                while (true) {
-                    __asm__ __volatile__("");
-                    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                                    AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
-                    __asm__ __volatile__("");
-                    if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
-                        break;
-                    }
-                }
-                uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
-                GemmCoord inGroupProblemShape{currentM, n, k};
-                LayoutPerTokenScale layoutPerTokenScale =
-                    wholeLayoutPerTokenScale.GetTileLayout(inGroupProblemShape.template GetCoordByAxis<0>());
-                LayoutD layoutD = layout::RowMajor{currentM, n};
-                EpilogueParams epilogueParams;
-                if constexpr (EXEC_FLAG & EXEC_FLAG_TENSOR_LIST) {
-                    gmScalePtr = reinterpret_cast<__gm__ ElementScale*>(
-                                    gmScaleListTensor.GetDataPtr<int32_t>(groupIdx));
-                    epilogueParams = EpilogueParams {
-                                                gmScalePtr, layoutScale,
-                                                gmTokenScale + gmGroupOffsetPerTokenScale, layoutPerTokenScale,
-                                                gmSwigluOutput + gmGroupOffsetD, layoutD};
-                } else {
-                    epilogueParams = EpilogueParams{gmScalePtr + gmGroupOffsetScale,
-                                                layoutScale,
-                                                gmTokenScale + gmGroupOffsetPerTokenScale,
-                                                layoutPerTokenScale,
-                                                gmSwigluOutput + gmGroupOffsetD,
-                                                layoutD};
-                }
-                blockScheduler.Update(inGroupProblemShape, L1TileShape::ToCoordMN());
-                blockEpilogue.UpdateParams(epilogueParams);
-                uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
-                GemmCoord blockShapeMNK = L1TileShape::ToCoord();
-                for (uint32_t producerAicIdx = compCoreIdx; producerAicIdx < aicNum;
-                     producerAicIdx += compCoreNum) {
+            for (uint32_t producerAicIdx = compCoreIdx; producerAicIdx < aicNum;
+                 producerAicIdx += compCoreNum) {
+                int64_t gmGroupOffsetScale = 0;
+                int64_t gmGroupOffsetPerTokenScale = 0;
+                int64_t gmGroupOffsetD = 0;
+                uint32_t expertRowBase = 0;
+                uint32_t startCoreIdx = 0;
+                uint32_t producerLoopOrder = 0;
+                __gm__ ElementScale* gmScalePtr;
+                if constexpr (EXEC_FLAG & EXEC_FLAG_TENSOR_LIST) {
+                    gmScalePtr = nullptr;
+                } else {
+                    gmScalePtr = reinterpret_cast<__gm__ ElementScale*>(gmScaleListTensor.GetDataPtr<int32_t>(0));
+                }
+
+                for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
+                    // just like AIC
+                    groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
+                                                            groupIdx * GROUP_INFO_SIZE);
+                    while (true) {
+                        __asm__ __volatile__("");
+                        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                        AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
+                        __asm__ __volatile__("");
+                        if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
+                            break;
+                        }
+                    }
+                    uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
+                    GemmCoord inGroupProblemShape{currentM, n, k};
+                    LayoutPerTokenScale layoutPerTokenScale =
+                        wholeLayoutPerTokenScale.GetTileLayout(inGroupProblemShape.template GetCoordByAxis<0>());
+                    LayoutD layoutD = layout::RowMajor{currentM, n};
+                    EpilogueParams epilogueParams;
+                    if constexpr (EXEC_FLAG & EXEC_FLAG_TENSOR_LIST) {
+                        gmScalePtr = reinterpret_cast<__gm__ ElementScale*>(
+                                        gmScaleListTensor.GetDataPtr<int32_t>(groupIdx));
+                        epilogueParams = EpilogueParams {
+                                                    gmScalePtr, layoutScale,
+                                                    gmTokenScale + gmGroupOffsetPerTokenScale, layoutPerTokenScale,
+                                                    gmSwigluOutput + gmGroupOffsetD, layoutD};
+                    } else {
+                        epilogueParams = EpilogueParams{gmScalePtr + gmGroupOffsetScale,
+                                                    layoutScale,
+                                                    gmTokenScale + gmGroupOffsetPerTokenScale,
+                                                    layoutPerTokenScale,
+                                                    gmSwigluOutput + gmGroupOffsetD,
+                                                    layoutD};
+                    }
+                    blockScheduler.Update(inGroupProblemShape, L1TileShape::ToCoordMN());
+                    blockEpilogue.UpdateParams(epilogueParams);
+                    uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+                    GemmCoord blockShapeMNK = L1TileShape::ToCoord();
                     uint32_t producerStartLoopIdx =
                         (producerAicIdx + aicNum - startCoreIdx) % aicNum;
-                    uint32_t producerLoopOrder = 0;
                     for (uint32_t loopIdx = producerStartLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
                         GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
                         GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
@@ -1512,16 +1516,16 @@ public:
                         EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(producerAicIdx));
                         producerLoopOrder += 1;
                     }
-                }
 
-                if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
-                    gmGroupOffsetScale += inGroupProblemShape.n();
-                }
-                gmGroupOffsetPerTokenScale += inGroupProblemShape.m();
-                gmGroupOffsetD += currentM * n;
-                expertRowBase += currentM;
+                    if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
+                        gmGroupOffsetScale += inGroupProblemShape.n();
+                    }
+                    gmGroupOffsetPerTokenScale += inGroupProblemShape.m();
+                    gmGroupOffsetD += currentM * n;
+                    expertRowBase += currentM;
 
-                startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
+                    startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
+                }
             }
         }
         if (!enableQuantPipeline) {
