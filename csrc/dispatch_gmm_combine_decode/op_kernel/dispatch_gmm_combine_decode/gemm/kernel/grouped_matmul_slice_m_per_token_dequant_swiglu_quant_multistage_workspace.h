@@ -25,9 +25,11 @@
 namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
+constexpr uint64_t TOKEN_ORDER_METADATA_LIMIT = STATE_WIN_OFFSET - TOKEN_ORDER_METADATA_OFFSET;
 constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = 256 * 1024;
 constexpr uint32_t PIPELINE_QUANT_ROW_ONCE = 1;
 using TokenOrderMetadataType = uint8_t;
+static_assert(TOKEN_ORDER_METADATA_OFFSET < STATE_WIN_OFFSET, "token-order metadata must stay before state window");
 
 template <class ArchTag>
 class BlockQuant
@@ -457,6 +459,19 @@ public:
     }
 
     CATLASS_DEVICE
+    uint64_t GetTokenOrderMetadataWorkspaceBytes(Params const &params) const
+    {
+        uint32_t expertNum = (params.epRankId < params.sharedExpertRankNum) ? 1 : params.moeExpertNumPerRank;
+        return static_cast<uint64_t>(expertNum) * params.epRankSize * params.bs * sizeof(TokenOrderMetadataType);
+    }
+
+    CATLASS_DEVICE
+    bool IsTokenOrderMetadataWorkspaceEnough(Params const &params) const
+    {
+        return GetTokenOrderMetadataWorkspaceBytes(params) <= TOKEN_ORDER_METADATA_LIMIT;
+    }
+
+    CATLASS_DEVICE
     bool ShouldEnableQuantPipeline(Params const &params) const
     {
         if (localExpertNum <= 1) {
@@ -693,7 +708,7 @@ public:
     CATLASS_DEVICE
     uint32_t GetTokenOrderMetadataIndex(uint32_t localExpertId, uint32_t srcRank, uint32_t localOrdinal)
     {
-        return (localExpertId * epRankSize + srcRank) * axisBS * axisK + localOrdinal;
+        return (localExpertId * epRankSize + srcRank) * axisBS + localOrdinal;
     }
 
     CATLASS_DEVICE
@@ -707,6 +722,9 @@ public:
     CATLASS_DEVICE
     void WriteTokenOrderMetadata(uint32_t dstRankId, uint32_t localExpertId, uint32_t localOrdinal, uint32_t srcTokenId)
     {
+        if (!enableTokenOrderMetadata || localOrdinal >= axisBS || srcTokenId >= axisBS) {
+            return;
+        }
         AscendC::GlobalTensor<TokenOrderMetadataType> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, epRankId, localOrdinal);
         GM_ADDR metadataGM = GetWinStateBaseAddrByRankId(dstRankId) + TOKEN_ORDER_METADATA_OFFSET +
@@ -844,7 +862,9 @@ public:
                 continue;
             }
             int32_t dstExpertId = curExpertId - sharedExpertRankNum;
-            WriteTokenOrderMetadataForExpert(dstExpertId);
+            if (enableTokenOrderMetadata) {
+                WriteTokenOrderMetadataForExpert(dstExpertId);
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
         PublishTokenCountStatus(startExpertId, endExpertId);
@@ -1619,6 +1639,8 @@ public:
         axisBS = params.bs;
         activeMaskBsCnt = axisBS;
         axisK = params.topK;
+        tokenOrderMetadataWorkspaceBytes = GetTokenOrderMetadataWorkspaceBytes(params);
+        enableTokenOrderMetadata = IsTokenOrderMetadataWorkspaceEnough(params);
         uint32_t maxAxisBs = params.globalBs / epRankSize;
 
         stateOffset = STATE_OFFSET;
@@ -1646,6 +1668,17 @@ public:
             AscendC::printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: ready flag workspace overflow, required=%u bytes, limit=262144 bytes, use legacy post SyncAll quant\n",
                             quantReadyWorkspaceBytes);
         }
+    }
+
+    CATLASS_DEVICE
+    void PrintTokenOrderMetadataFallback()
+    {
+        if (aivIdx != 0 || localExpertNum <= 1 || enableTokenOrderMetadata) {
+            return;
+        }
+        AscendC::printf("[dispatch_gmm_combine_decode][w8a8_token_order_metadata] fallback: metadata workspace overflow, required=%u bytes, limit=%u bytes, use legacy localOrdinal combine\n",
+                        static_cast<uint32_t>(tokenOrderMetadataWorkspaceBytes),
+                        static_cast<uint32_t>(TOKEN_ORDER_METADATA_LIMIT));
     }
 
     CATLASS_DEVICE
@@ -1854,6 +1887,7 @@ public:
     {
         AivInitParams(params);
         AivInitState();
+        PrintTokenOrderMetadataFallback();
         PrintQuantPipelineFallback(params);
         if (enableQuantPipeline) {
             ClearQuantReadyFlags();
@@ -1986,6 +2020,7 @@ private:
     bool isRecvCompCore{false};
     bool isQuantCore{false};
     bool enableQuantPipeline{false};
+    bool enableTokenOrderMetadata{false};
     uint32_t aiCoreGroupNum{0};
     uint32_t aiCoreGroupIdx{0};
     uint32_t subBlockNum{0};
@@ -2012,6 +2047,7 @@ private:
     uint32_t quantExpectedNTiles{0};
     uint32_t quantReadyFlagCount{0};
     uint32_t quantReadyWorkspaceBytes{0};
+    uint64_t tokenOrderMetadataWorkspaceBytes{0};
     uint32_t quantEpoch{0};
 };
 

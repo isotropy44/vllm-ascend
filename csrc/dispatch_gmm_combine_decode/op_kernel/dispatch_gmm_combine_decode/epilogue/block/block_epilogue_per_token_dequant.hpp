@@ -210,11 +210,14 @@ public:
     CATLASS_DEVICE uint32_t GetTokenOrderMetadataIndex(uint32_t localExpertId, uint32_t srcRank,
                                                        uint32_t localOrdinal)
     {
-        return (localExpertId * calcInfo.epWorldSize_ + srcRank) * calcInfo.axisBS_ * calcInfo.axisK_ + localOrdinal;
+        return (localExpertId * calcInfo.epWorldSize_ + srcRank) * calcInfo.axisBS_ + localOrdinal;
     }
 
     CATLASS_DEVICE uint32_t GetSourceTokenId(uint32_t localExpertId, uint32_t srcRank, uint32_t localOrdinal)
     {
+        if (!calcInfo.enableTokenOrderMetadata_ || localOrdinal >= calcInfo.axisBS_) {
+            return localOrdinal;
+        }
         AscendC::GlobalTensor<uint8_t> tokenOrderMetadataTensor;
         uint32_t metadataIndex = GetTokenOrderMetadataIndex(localExpertId, srcRank, localOrdinal);
         GM_ADDR metadataGM = GetWinStateBaseAddrByRankId(calcInfo.epRankId_) +

@@ -34,6 +34,8 @@ constexpr uint64_t STATE_WIN_OFFSET = 900 * 1024;
 constexpr uint16_t SEND_SYNC_EVENT_ID = 9;
 constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
+constexpr uint64_t TOKEN_ORDER_METADATA_LIMIT = STATE_WIN_OFFSET - TOKEN_ORDER_METADATA_OFFSET;
+static_assert(TOKEN_ORDER_METADATA_OFFSET < STATE_WIN_OFFSET, "token-order metadata must stay before state window");
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncFunc()
@@ -56,6 +58,7 @@ struct CombineCalcInfo {
     uint32_t axisK_;
     uint32_t moeSendNum_;
     bool isShardExpert_;
+    bool enableTokenOrderMetadata_;
     GM_ADDR epSendCount_;
     __gm__ HcclOpResParam *epWinContext_;
     uint64_t winDataSizeOffset_;
@@ -338,6 +341,10 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::Init(
     calcInfo_.axisK_ = axisK_;
     calcInfo_.moeSendNum_ = moeSendNum_;
     calcInfo_.isShardExpert_ = isShardExpert_;
+    uint32_t tokenOrderExpertNum = isShardExpert_ ? 1 : moeExpertPerRankNum_;
+    uint64_t tokenOrderMetadataBytes = static_cast<uint64_t>(tokenOrderExpertNum) * epWorldSize_ * axisBS_ *
+                                       sizeof(uint8_t);
+    calcInfo_.enableTokenOrderMetadata_ = tokenOrderMetadataBytes <= TOKEN_ORDER_METADATA_LIMIT;
     calcInfo_.epSendCount_ = epSendCount;
     calcInfo_.epWinContext_ = epWinContext_;
     calcInfo_.winDataSizeOffset_ = winDataSizeOffset_;
