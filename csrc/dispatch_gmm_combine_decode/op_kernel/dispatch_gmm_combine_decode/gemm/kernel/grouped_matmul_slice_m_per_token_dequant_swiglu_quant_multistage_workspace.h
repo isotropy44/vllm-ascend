@@ -1625,12 +1625,12 @@ public:
         }
         uint32_t plannedRecvCompCoreNum = GetPlannedRecvCompCoreNum(aiCoreGroupNum);
         if (plannedRecvCompCoreNum >= aiCoreGroupNum) {
-            printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: quantCoreNum=0, use legacy post SyncAll quant\n");
+            AscendC::printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: quantCoreNum=0, use legacy post SyncAll quant\n");
             return;
         }
         if (!IsQuantPipelineWorkspaceEnough(params)) {
-            printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: ready flag workspace overflow, required=%u bytes, limit=262144 bytes, use legacy post SyncAll quant\n",
-                   quantReadyWorkspaceBytes);
+            AscendC::printf("[dispatch_gmm_combine_decode][w8a8_dynamic_quant_pipeline] fallback: ready flag workspace overflow, required=%u bytes, limit=262144 bytes, use legacy post SyncAll quant\n",
+                            quantReadyWorkspaceBytes);
         }
     }
 
