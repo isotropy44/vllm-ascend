@@ -1521,7 +1521,14 @@ public:
                 startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
             }
         }
-        // clean
+        if (!enableQuantPipeline) {
+            CleanSoftSyncFlags(compCoreIdx, compCoreNum);
+        }
+    }
+
+    CATLASS_DEVICE
+    void CleanSoftSyncFlags(uint32_t cleanCoreIdx, uint32_t cleanCoreNum)
+    {
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::GlobalTensor<int32_t> softSyncTensor;
         softSyncTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + SOFT_SYNC_OFFSET));
@@ -1529,9 +1536,9 @@ public:
         AscendC::Duplicate(tmpZeroLocalTensor, (int32_t)0, INT32_COUNT_PER_BLOCK);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-        for (uint32_t flagIdx = compCoreIdx; flagIdx < aicNum * 2; flagIdx += compCoreNum) {
+        for (uint32_t flagIdx = cleanCoreIdx; flagIdx < aicNum * 2; flagIdx += cleanCoreNum) {
             AscendC::DataCopy(softSyncTensor[flagIdx * SOFT_SYNC_SPACE_SIZE / sizeof(int32_t)], tmpZeroLocalTensor,
-                            INT32_COUNT_PER_BLOCK);
+                              INT32_COUNT_PER_BLOCK);
         }
     }
 
@@ -1866,6 +1873,9 @@ public:
                 RunPipelinedDynamicQuant(params, gmSwigluOutput);
             }
             icache_preload(8);
+            AscendC::SyncAll<false>();
+            AscendC::PipeBarrier<PIPE_ALL>();
+            CleanSoftSyncFlags(aivIdx, aivNum);
             AscendC::SyncAll<false>();
             AscendC::PipeBarrier<PIPE_ALL>();
             UpdateAndCleanInfo(params.ptrGroupList, params.gmEpSendCount, params.gmExpertTokenNums);
