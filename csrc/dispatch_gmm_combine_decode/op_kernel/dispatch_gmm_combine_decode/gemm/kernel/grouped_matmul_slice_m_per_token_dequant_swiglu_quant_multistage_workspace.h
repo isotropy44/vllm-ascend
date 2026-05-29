@@ -790,6 +790,61 @@ public:
     }
 
     CATLASS_DEVICE
+    GM_ADDR GetLocalMoeStagingAddr(uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal)
+    {
+        return GET_WIND_ADDR_BY_RANK_ID(epRankId) +
+               (dstRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize;
+    }
+
+    CATLASS_DEVICE
+    GM_ADDR GetLocalSharedStagingAddr(uint32_t dstRankId, uint32_t ordinal)
+    {
+        return GET_WIND_ADDR_BY_RANK_ID(epRankId) + dstRankId * expertPerSizeOnWin + ordinal * hCommuSize;
+    }
+
+    CATLASS_DEVICE
+    GM_ADDR GetRemoteMoeStagingAddr(uint32_t srcRankId, uint32_t localExpertId, uint32_t ordinal)
+    {
+        return GET_WIND_ADDR_BY_RANK_ID(srcRankId) +
+               (epRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize;
+    }
+
+    CATLASS_DEVICE
+    GM_ADDR GetRemoteSharedStagingAddr(uint32_t srcRankId, uint32_t ordinal)
+    {
+        return GET_WIND_ADDR_BY_RANK_ID(srcRankId) + epRankId * expertPerSizeOnWin + ordinal * hCommuSize;
+    }
+
+    CATLASS_DEVICE
+    void ClearLocalStagingTokenFlags()
+    {
+        if (!isSendCore || hCommuSize == 0 || sendCoreNum == 0) {
+            return;
+        }
+        uint32_t tokenSlotCount = static_cast<uint32_t>(expertPerSizeOnWin / hCommuSize);
+        if (tokenSlotCount == 0) {
+            return;
+        }
+
+        uint64_t totalFlagCount = static_cast<uint64_t>(expertCntUp) * tokenSlotCount;
+        for (uint64_t flagIdx = sendCoreIdx; flagIdx < totalFlagCount; flagIdx += sendCoreNum) {
+            uint32_t slotId = static_cast<uint32_t>(flagIdx / tokenSlotCount);
+            uint32_t ordinal = static_cast<uint32_t>(flagIdx % tokenSlotCount);
+            GM_ADDR flagGM = GET_WIND_ADDR_BY_RANK_ID(epRankId) + slotId * expertPerSizeOnWin +
+                             ordinal * hCommuSize + hOutSize + sizeof(int32_t);
+            AscendC::GlobalTensor<int32_t> flagTensor;
+            flagTensor.SetGlobalBuffer((__gm__ int32_t *)flagGM);
+            flagTensor.SetValue(0, 0);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(
+                flagTensor[0]);
+            __asm__ __volatile__("");
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
     void CalAndSendTokenCount()
     {
         uint32_t totalExpertNum = sharedExpertRankNum + moeExpertNum;
@@ -964,8 +1019,6 @@ public:
             uint32_t moeOnShareRank = CEIL((tokenIndex + 1 + temp) * sharedExpertRankNum, axisBS) - 1 - epRankId;
             uint32_t preCnt = (moeOnShareRank + epRankId) * axisBS / sharedExpertRankNum -
                                 epRankId * axisBS / sharedExpertRankNum;
-            dstWinGMTensor.SetGlobalBuffer(
-                (__gm__ int8_t *)(GET_WIND_ADDR_BY_RANK_ID(moeOnShareRank) + expertPerSizeOnWin * epRankId));
 
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventId);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
@@ -984,11 +1037,11 @@ public:
                 AscendC::DataCopyPad(dynamicScalesOutGMTensor_[tokenIndex],
                                         yFp32Tensor[index][tokenLength / sizeof(float)], dataCopyParamsFloat);
             } else {
-                AscendC::DataCopy(dstWinGMTensor[(tokenIndex - preCnt) * axisHCommu], yInt8Tensor[index],
-                                    tokenLength);
+                GM_ADDR rankGM = GetLocalSharedStagingAddr(moeOnShareRank, tokenIndex - preCnt);
+                dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
+                AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
-                AscendC::DataCopy(dstWinGMTensor[(tokenIndex - preCnt) * axisHCommu + tokenLength],
-                                    yInt8Tensor[index][tokenLength], scaleParamPad);
+                AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1059,10 +1112,8 @@ public:
                 CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, ubOffset);
                 expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
                 uint32_t tempRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
-                GM_ADDR rankGM = (__gm__ uint8_t *)(GET_WIND_ADDR_BY_RANK_ID(tempRankId) +
-                                                    (expertPerSizeOnWin * (epRankId * moeExpertNumPerRank +
-                                                                           dstExpertId % moeExpertNumPerRank)) +
-                                                    hCommuSize * curExpertCnt);
+                GM_ADDR rankGM =
+                    GetLocalMoeStagingAddr(tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt);
                 dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1261,14 +1312,14 @@ public:
                 beginIdx += count;
                 continue;
             }
-            uint32_t winOffset = index;
-            if (!isShareExpert && moeExpertNumPerRank > 1) {
-                // srcRank: index % epRankSize
-                // localExpertId: index / epRankSize
-                // Addr: (srcRank * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin
-                winOffset = (index % epRankSize) * moeExpertNumPerRank + index / epRankSize;
+            GM_ADDR wAddr = 0;
+            if (isShareExpert) {
+                wAddr = GetRemoteSharedStagingAddr(index, 0);
+            } else {
+                uint32_t srcRankId = index % epRankSize;
+                uint32_t localExpertId = index / epRankSize;
+                wAddr = GetRemoteMoeStagingAddr(srcRankId, localExpertId, 0);
             }
-            GM_ADDR wAddr = (__gm__ uint8_t *)(GET_WIND_ADDR_BY_RANK_ID(epRankId)) + winOffset * expertPerSizeOnWin;
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             for (uint32_t j = 0; j < count; j++) {
                 tokGlobal.SetGlobalBuffer((__gm__ int8_t *)(wAddr + j * hCommuSize));
@@ -1280,11 +1331,6 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
                     if (tmpLocalTensor.GetValue(1) == tokenFlag) {
-                        tokGlobalInt32.SetValue(1, 0);
-                        __asm__ __volatile__("");
-                        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                                        AscendC::DcciDst::CACHELINE_OUT>(tokGlobalInt32[1]);
-                        __asm__ __volatile__("");
                         break;
                     }
                 }
@@ -1891,9 +1937,10 @@ public:
         PrintQuantPipelineFallback(params);
         if (enableQuantPipeline) {
             ClearQuantReadyFlags();
-            AscendC::SyncAll<false>();
-            AscendC::PipeBarrier<PIPE_ALL>();
         }
+        ClearLocalStagingTokenFlags();
+        AscendC::SyncAll<false>();
+        AscendC::PipeBarrier<PIPE_ALL>();
         if (isSendCore) {
             SendCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
                         (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx, (GM_ADDR)params.gmXActiveMask);
