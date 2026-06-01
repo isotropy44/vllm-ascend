@@ -845,6 +845,21 @@ public:
     }
 
     CATLASS_DEVICE
+    void PublishLocalStagingTokenFlag(GM_ADDR tokenGM, int32_t eventId)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(eventId);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
+        AscendC::GlobalTensor<int32_t> flagTensor;
+        flagTensor.SetGlobalBuffer((__gm__ int32_t *)(tokenGM + hOutSize + sizeof(int32_t)));
+        flagTensor.SetValue(0, tokenFlag);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(
+            flagTensor[0]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
     void CalAndSendTokenCount()
     {
         uint32_t totalExpertNum = sharedExpertRankNum + moeExpertNum;
@@ -951,7 +966,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
         float dynamicQuantScale = float(127.0) / xRowMaxTensor.GetValue(0);
         yFp32Tensor.SetValue(tokenLength / sizeof(float), float(1.0) / dynamicQuantScale);
-        yInt32Tensor.SetValue(tokenLength / sizeof(int32_t) + 1, tokenFlag);
+        yInt32Tensor.SetValue(tokenLength / sizeof(int32_t) + 1, 0);
         AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
@@ -1042,6 +1057,7 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
+                PublishLocalStagingTokenFlag(rankGM, eventId);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1130,6 +1146,7 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
+                PublishLocalStagingTokenFlag(rankGM, eventId);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
             }
