@@ -28,6 +28,8 @@ constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_O
 constexpr uint64_t TOKEN_ORDER_METADATA_LIMIT = STATE_WIN_OFFSET - TOKEN_ORDER_METADATA_OFFSET;
 constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = 256 * 1024;
 constexpr uint32_t PIPELINE_QUANT_ROW_ONCE = 1;
+constexpr bool DISPATCH_RECV_PULL_DEBUG = true;
+constexpr uint32_t DISPATCH_RECV_PULL_DEBUG_SPIN_INTERVAL = 1U << 24;
 using TokenOrderMetadataType = uint8_t;
 static_assert(TOKEN_ORDER_METADATA_OFFSET < STATE_WIN_OFFSET, "token-order metadata must stay before state window");
 
@@ -841,6 +843,14 @@ public:
                 flagTensor[0]);
             __asm__ __volatile__("");
         }
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            if (sendCoreIdx == 0) {
+                AscendC::printf("[dgcd-pull-debug][clear-flags] rank=%u total_slots=%u token_slot_count=%u "
+                                "expert_cnt_up=%u h_commu=%u token_flag=0x%x\n",
+                                epRankId, static_cast<uint32_t>(totalFlagCount), tokenSlotCount, expertCntUp,
+                                hCommuSize, tokenFlag);
+            }
+        }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -857,6 +867,87 @@ public:
                                           AscendC::DcciDst::CACHELINE_OUT>(
             flagTensor[0]);
         __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    void DebugPrintAivConfig()
+    {
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            if (aivIdx == 0) {
+                AscendC::printf("[dgcd-pull-debug][init] rank=%u is_share=%u local_experts=%u ep_ranks=%u "
+                                "send_cores=%u recv_comp_cores=%u quant_pipe=%u token_metadata=%u "
+                                "data_state=%d count_state=%d token_flag=0x%x h_out=%u scale_pad=%u h_commu=%u "
+                                "expert_per_win_low32=%u win_offset_low32=%u\n",
+                                epRankId, static_cast<uint32_t>(isShareExpert), localExpertNum, epRankSize,
+                                sendCoreNum, recvCompCoreNum, static_cast<uint32_t>(enableQuantPipeline),
+                                static_cast<uint32_t>(enableTokenOrderMetadata), dataState, state, tokenFlag,
+                                hOutSize, scaleParamPad, hCommuSize, static_cast<uint32_t>(expertPerSizeOnWin),
+                                static_cast<uint32_t>(winDataSizeOffset));
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void DebugPrintSendSlot(uint32_t stage, uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal,
+                            uint32_t tokenIndex, GM_ADDR rankGM, bool sharedSlot)
+    {
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            if (ordinal == 0) {
+                uint32_t stagingOffset =
+                    static_cast<uint32_t>(rankGM - GET_WIND_ADDR_BY_RANK_ID(epRankId));
+                AscendC::printf("[dgcd-pull-debug][send-slot] rank=%u core=%u stage=%u shared=%u dst_rank=%u "
+                                "local_expert=%u ordinal=%u token_index=%u staging_offset=%u flag_offset=%u "
+                                "token_flag=0x%x\n",
+                                epRankId, sendCoreIdx, stage, static_cast<uint32_t>(sharedSlot), dstRankId,
+                                localExpertId, ordinal, tokenIndex, stagingOffset,
+                                stagingOffset + hOutSize + static_cast<uint32_t>(sizeof(int32_t)), tokenFlag);
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void DebugPrintRecvSlot(uint32_t index, uint32_t count, uint32_t beginIdx, uint32_t srcRankId,
+                            uint32_t localExpertId, GM_ADDR wAddr, bool sharedSlot)
+    {
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            if (count > 0) {
+                uint32_t stagingOffset =
+                    static_cast<uint32_t>(wAddr - GET_WIND_ADDR_BY_RANK_ID(srcRankId));
+                AscendC::printf("[dgcd-pull-debug][recv-plan] rank=%u core=%u shared=%u index=%u src_rank=%u "
+                                "local_expert=%u count=%u begin_idx=%u staging_offset=%u flag_offset=%u "
+                                "token_flag=0x%x\n",
+                                epRankId, recvCompCoreIdx, static_cast<uint32_t>(sharedSlot), index, srcRankId,
+                                localExpertId, count, beginIdx, stagingOffset,
+                                stagingOffset + hOutSize + static_cast<uint32_t>(sizeof(int32_t)), tokenFlag);
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void DebugPrintRecvWait(uint32_t index, uint32_t ordinal, uint32_t srcRankId, uint32_t localExpertId,
+                            uint32_t spinCount, int32_t observedFlag, GM_ADDR wAddr, bool done)
+    {
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            uint32_t stagingOffset =
+                static_cast<uint32_t>(wAddr - GET_WIND_ADDR_BY_RANK_ID(srcRankId));
+            AscendC::printf("[dgcd-pull-debug][recv-wait] rank=%u core=%u done=%u index=%u src_rank=%u "
+                            "local_expert=%u ordinal=%u spins=%u observed=0x%x expected=0x%x "
+                            "staging_offset=%u flag_offset=%u\n",
+                            epRankId, recvCompCoreIdx, static_cast<uint32_t>(done), index, srcRankId, localExpertId,
+                            ordinal, spinCount, observedFlag, tokenFlag, stagingOffset,
+                            stagingOffset + hOutSize + static_cast<uint32_t>(sizeof(int32_t)));
+        }
+    }
+
+    CATLASS_DEVICE
+    void DebugPrintStage(uint32_t stage, uint32_t value0, uint32_t value1, uint32_t value2, uint32_t value3)
+    {
+        if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+            AscendC::printf("[dgcd-pull-debug][stage] rank=%u aiv=%u send_core=%u recv_core=%u stage=%u "
+                            "v0=%u v1=%u v2=%u v3=%u token_flag=0x%x\n",
+                            epRankId, aivIdx, sendCoreIdx, recvCompCoreIdx, stage, value0, value1, value2, value3,
+                            tokenFlag);
+        }
     }
 
     CATLASS_DEVICE
@@ -938,6 +1029,7 @@ public:
         }
         AscendC::PipeBarrier<PIPE_ALL>();
         PublishTokenCountStatus(startExpertId, endExpertId);
+        DebugPrintStage(100, startExpertId, endExpertId, totalExpertNum, sendCoreIdx);
     }
 
     CATLASS_DEVICE
@@ -1057,7 +1149,9 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
+                DebugPrintSendSlot(1, moeOnShareRank, 0, tokenIndex - preCnt, tokenIndex, rankGM, true);
                 PublishLocalStagingTokenFlag(rankGM, eventId);
+                DebugPrintSendSlot(2, moeOnShareRank, 0, tokenIndex - preCnt, tokenIndex, rankGM, true);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1146,7 +1240,11 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
+                DebugPrintSendSlot(1, tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt, tokenIndex, rankGM,
+                                   false);
                 PublishLocalStagingTokenFlag(rankGM, eventId);
+                DebugPrintSendSlot(2, tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt, tokenIndex, rankGM,
+                                   false);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
             }
@@ -1330,25 +1428,40 @@ public:
                 continue;
             }
             GM_ADDR wAddr = 0;
+            uint32_t srcRankId = index;
+            uint32_t localExpertId = 0;
             if (isShareExpert) {
                 wAddr = GetRemoteSharedStagingAddr(index, 0);
             } else {
-                uint32_t srcRankId = index % epRankSize;
-                uint32_t localExpertId = index / epRankSize;
+                srcRankId = index % epRankSize;
+                localExpertId = index / epRankSize;
                 wAddr = GetRemoteMoeStagingAddr(srcRankId, localExpertId, 0);
             }
+            DebugPrintRecvSlot(index, count, beginIdx, srcRankId, localExpertId, wAddr, isShareExpert);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             for (uint32_t j = 0; j < count; j++) {
                 tokGlobal.SetGlobalBuffer((__gm__ int8_t *)(wAddr + j * hCommuSize));
                 tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(wAddr + j * hCommuSize + hOutSize));
                 expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
 
+                uint32_t spinCount = 0;
                 while (true) {
                     AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-                    if (tmpLocalTensor.GetValue(1) == tokenFlag) {
+                    int32_t observedFlag = tmpLocalTensor.GetValue(1);
+                    if (observedFlag == tokenFlag) {
+                        if (j == 0) {
+                            DebugPrintRecvWait(index, j, srcRankId, localExpertId, spinCount, observedFlag, wAddr, true);
+                        }
                         break;
+                    }
+                    spinCount += 1;
+                    if constexpr (DISPATCH_RECV_PULL_DEBUG) {
+                        if ((spinCount & (DISPATCH_RECV_PULL_DEBUG_SPIN_INTERVAL - 1)) == 0) {
+                            DebugPrintRecvWait(index, j, srcRankId, localExpertId, spinCount, observedFlag, wAddr,
+                                               false);
+                        }
                     }
                 }
                 AscendC::PipeBarrier<PIPE_ALL>();
@@ -1397,7 +1510,9 @@ public:
     void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount)
     {
         ubOffset = 0;
+        DebugPrintStage(200, recvCompCoreIdx, recvCompCoreNum, localExpertNum, 0);
         RecvCount(ubOffset);
+        DebugPrintStage(201, recvCompCoreIdx, recvCompCoreNum, localExpertNum, 0);
 
         uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
         uint32_t groupId = 0;
@@ -1423,8 +1538,11 @@ public:
 
         if (startRankId < recvExpertNum) {
             // RecvCount, GetCumSum, RecvToken must use the same ubOffset to get right info
+            DebugPrintStage(202, groupId, startRankId, endRankId, recvExpertNum);
             GetCumSum(startRankId, recvExpertNum, ubOffset);
+            DebugPrintStage(203, groupId, startRankId, endRankId, recvExpertNum);
             RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
+            DebugPrintStage(204, groupId, startRankId, endRankId, coreTokenCount);
         }
 
         // recv finish, inform AIC
@@ -1950,6 +2068,7 @@ public:
     {
         AivInitParams(params);
         AivInitState();
+        DebugPrintAivConfig();
         PrintTokenOrderMetadataFallback();
         PrintQuantPipelineFallback(params);
         if (enableQuantPipeline) {
