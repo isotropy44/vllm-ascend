@@ -482,9 +482,9 @@ static ge::graphStatus SetWindowLayout(const char *nodeName, DispatchGmmCombineD
     uint64_t batchSize = static_cast<uint64_t>(info.bs);
     uint64_t topK = static_cast<uint64_t>(info.k);
     uint64_t h = static_cast<uint64_t>(info.h);
-    uint64_t expertPerSizeOnWin = maxBatchSize * h * TOKEN_DTYPE_BYTE_SIZE;
-    uint64_t oldDataWindowBytesPerState = epRankSize * moeExpertNumPerRank * expertPerSizeOnWin;
     uint64_t hCommuSize = h + DYNAMIC_QUANT_SCALE_PAD;
+    uint64_t expertPerSizeOnWin = maxBatchSize * hCommuSize;
+    uint64_t oldDataWindowBytesPerState = epRankSize * moeExpertNumPerRank * expertPerSizeOnWin;
     uint64_t exportTokenSlots = batchSize * topK;
     if (info.sharedExpertRankNum > 0) {
         exportTokenSlots += batchSize;

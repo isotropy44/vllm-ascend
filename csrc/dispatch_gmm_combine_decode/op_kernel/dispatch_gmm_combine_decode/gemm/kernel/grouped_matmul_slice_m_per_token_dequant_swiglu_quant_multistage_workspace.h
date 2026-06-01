@@ -28,6 +28,8 @@ constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_O
 constexpr uint64_t TOKEN_ORDER_METADATA_LIMIT = STATE_WIN_OFFSET - TOKEN_ORDER_METADATA_OFFSET;
 constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = 256 * 1024;
 constexpr uint32_t PIPELINE_QUANT_ROW_ONCE = 1;
+constexpr uint32_t RECV_PULL_CHUNK_BYTES = 32 * 1024;
+constexpr uint32_t MAX_RECV_PULL_CHUNK_TOKENS = 8;
 using TokenOrderMetadataType = uint8_t;
 static_assert(TOKEN_ORDER_METADATA_OFFSET < STATE_WIN_OFFSET, "token-order metadata must stay before state window");
 
@@ -799,12 +801,6 @@ public:
     }
 
     CATLASS_DEVICE
-    uint32_t GetMoeExportPayloadOffset(uint32_t tokenIndex)
-    {
-        return static_cast<uint32_t>(static_cast<uint64_t>(tokenIndex) * hCommuSize);
-    }
-
-    CATLASS_DEVICE
     uint32_t GetSharedExportPayloadOffset(uint32_t tokenIndex)
     {
         uint64_t moeExportBytes = static_cast<uint64_t>(axisBS) * axisK * hCommuSize;
@@ -824,10 +820,10 @@ public:
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetRemoteMoeInfoAddr(uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal)
+    GM_ADDR GetRemoteMoeInfoHeaderAddr(uint32_t dstRankId, uint32_t localExpertId)
     {
         return GET_WIND_ADDR_BY_RANK_ID(dstRankId) +
-               (epRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize + hOutSize;
+               (epRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin;
     }
 
     CATLASS_DEVICE
@@ -837,11 +833,10 @@ public:
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetLocalMoeInfoAddr(uint32_t srcRankId, uint32_t localExpertId, uint32_t ordinal)
+    GM_ADDR GetLocalMoeInfoHeaderAddr(uint32_t srcRankId, uint32_t localExpertId)
     {
         return GET_WIND_ADDR_BY_RANK_ID(epRankId) +
-               (srcRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize +
-               hOutSize;
+               (srcRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin;
     }
 
     CATLASS_DEVICE
@@ -864,6 +859,74 @@ public:
                                           AscendC::DcciDst::CACHELINE_OUT>(
             infoTensor[0]);
         __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    void PublishRemoteMoeGroupInfo(GM_ADDR infoGM, uint32_t payloadBaseOffset, bool writePayloadOffset)
+    {
+        AscendC::GlobalTensor<int32_t> infoTensor;
+        infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
+        if (writePayloadOffset) {
+            infoTensor.SetValue(0, static_cast<int32_t>(payloadBaseOffset));
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(infoTensor[0]);
+            __asm__ __volatile__("");
+        }
+        uint32_t flagSlot = 1 + sendCoreIdx;
+        infoTensor.SetValue(flagSlot, tokenFlag);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[flagSlot]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, AscendC::LocalTensor<int32_t> &tmpLocalTensor)
+    {
+        AscendC::GlobalTensor<int32_t> infoTensor;
+        infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
+        uint32_t payloadBaseOffset = 0;
+        while (true) {
+            bool ready = true;
+            for (uint32_t slotBase = 0; slotBase <= sendToMoeAivNum; slotBase += INT32_COUNT_PER_BLOCK) {
+                AscendC::DataCopy(tmpLocalTensor, infoTensor[slotBase], INT32_COUNT_PER_BLOCK);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+                if (slotBase == 0) {
+                    payloadBaseOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
+                }
+                uint32_t slotEnd = slotBase + INT32_COUNT_PER_BLOCK;
+                uint32_t maxSlot = sendToMoeAivNum + 1;
+                if (slotEnd > maxSlot) {
+                    slotEnd = maxSlot;
+                }
+                uint32_t slot = (slotBase == 0) ? 1 : slotBase;
+                for (; slot < slotEnd; ++slot) {
+                    if (tmpLocalTensor.GetValue(slot - slotBase) != tokenFlag) {
+                        ready = false;
+                    }
+                }
+            }
+            if (ready) {
+                break;
+            }
+        }
+        return payloadBaseOffset;
+    }
+
+    CATLASS_DEVICE
+    void ClearMoeGroupInfoReady(GM_ADDR infoGM)
+    {
+        AscendC::GlobalTensor<int32_t> infoTensor;
+        infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
+        for (uint32_t slot = 1; slot <= sendToMoeAivNum; ++slot) {
+            infoTensor.SetValue(slot, 0);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(infoTensor[slot]);
+            __asm__ __volatile__("");
+        }
     }
 
     CATLASS_DEVICE
@@ -1090,12 +1153,30 @@ public:
             startTokenId += remainderTokenNum;
         }
         uint32_t endTokenId = startTokenId + sendTokenNum;
-        if (startTokenId >= expertIdsCnt) {
-            return;
-        }
+        bool hasAssignedTokens = (startTokenId < expertIdsCnt) && (sendTokenNum > 0);
         AscendC::LocalTensor<int32_t> expertCountTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
         ubOffset += CEIL_UP(expertIdsCnt * sizeof(int32_t));
         AscendC::Duplicate(expertCountTensor, (int32_t)0, expertIdsCnt);
+        AscendC::LocalTensor<int32_t> groupCountTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
+        ubOffset += CEIL_UP(moeExpertNum * sizeof(int32_t));
+        AscendC::LocalTensor<int32_t> groupBaseTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
+        ubOffset += CEIL_UP(moeExpertNum * sizeof(int32_t));
+        for (uint32_t expertIndex = 0; expertIndex < moeExpertNum; ++expertIndex) {
+            groupCountTensor(expertIndex) = 0;
+            groupBaseTensor(expertIndex) = 0;
+        }
+        for (uint32_t tokenIndex = 0; tokenIndex < expertIdsCnt; ++tokenIndex) {
+            int32_t dstExpertId = expertIdsTensor_(tokenIndex);
+            if (dstExpertId >= 0 && dstExpertId < static_cast<int32_t>(moeExpertNum)) {
+                uint32_t expertIndex = static_cast<uint32_t>(dstExpertId);
+                groupCountTensor(expertIndex) = groupCountTensor(expertIndex) + 1;
+            }
+        }
+        int32_t groupBase = 0;
+        for (uint32_t expertIndex = 0; expertIndex < moeExpertNum; ++expertIndex) {
+            groupBaseTensor(expertIndex) = groupBase;
+            groupBase += groupCountTensor(expertIndex);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_S>(1);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(1);
 
@@ -1121,7 +1202,7 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
         uint32_t sendValidTokenIndex = 0;
         for (uint32_t sendGroupIndex = 0; sendGroupIndex < moeExpertNumPerRank; ++sendGroupIndex) {
-            for (uint32_t tokenIndex = startTokenId; tokenIndex < endTokenId; ++tokenIndex) {
+            for (uint32_t tokenIndex = startTokenId; tokenIndex < endTokenId && hasAssignedTokens; ++tokenIndex) {
                 int32_t dstExpertId = expertIdsTensor_(tokenIndex);
                 if (dstExpertId < 0) {
                     continue;
@@ -1136,8 +1217,9 @@ public:
                 int32_t curExpertCnt = 0;
                 CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, ubOffset);
                 expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
-                uint32_t tempRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
-                uint32_t payloadOffset = GetMoeExportPayloadOffset(tokenIndex);
+                uint32_t expertIndex = static_cast<uint32_t>(dstExpertId);
+                uint32_t payloadTokenOffset = static_cast<uint32_t>(groupBaseTensor(expertIndex) + curExpertCnt);
+                uint32_t payloadOffset = static_cast<uint32_t>(static_cast<uint64_t>(payloadTokenOffset) * hCommuSize);
                 GM_ADDR rankGM = GetLocalExportPayloadAddr(payloadOffset);
                 dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
 
@@ -1155,24 +1237,38 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
-                GM_ADDR infoGM = GetRemoteMoeInfoAddr(tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt);
-                PublishRemotePayloadInfo(infoGM, payloadOffset, eventId);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
             }
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+            for (uint32_t dstExpertId = sendGroupIndex; dstExpertId < moeExpertNum; dstExpertId += moeExpertNumPerRank) {
+                if (groupCountTensor(dstExpertId) == 0) {
+                    continue;
+                }
+                uint32_t dstRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
+                uint32_t payloadBaseOffset =
+                    static_cast<uint32_t>(static_cast<uint64_t>(groupBaseTensor(dstExpertId)) * hCommuSize);
+                GM_ADDR infoGM = GetRemoteMoeInfoHeaderAddr(dstRankId, sendGroupIndex);
+                PublishRemoteMoeGroupInfo(infoGM, payloadBaseOffset, sendCoreIdx == 0);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
 
-        AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
-        expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx + startTokenId);
-        AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(sendTokenNum * sizeof(uint32_t)), 0U,
-                                                         0U, 0U};
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::DataCopyPad(expandIdxGMTensor, expertCountTensor, expertIdsCntParams);
+        if (hasAssignedTokens) {
+            AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
+            expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx + startTokenId);
+            AscendC::DataCopyExtParams expertIdsCntParams = {
+                1U, static_cast<uint32_t>(sendTokenNum * sizeof(uint32_t)), 0U, 0U, 0U};
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+            AscendC::DataCopyPad(expandIdxGMTensor, expertCountTensor, expertIdsCntParams);
+        }
     }
 
     CATLASS_DEVICE void
@@ -1315,7 +1411,7 @@ public:
 
         AscendC::DataCopyExtParams dataCopyParamsFloat = {1U, sizeof(float), 0U, 0U, 0U};
         AscendC::LocalTensor<int8_t> xTmpTensor_ = resource.ubBuf.template GetBufferByByte<int8_t>(subUbOffset);
-        subUbOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
+        subUbOffset += CEIL_UP(recvPullChunkTokens * axisHCommu * sizeof(int8_t));
         AscendC::LocalTensor<float> xOutFp32Tensor_ = xTmpTensor_.template ReinterpretCast<float>();
         AscendC::LocalTensor<int32_t> tmpLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(subUbOffset);
         subUbOffset += CEIL_UP(UB_BLOCK_SIZE);
@@ -1339,50 +1435,83 @@ public:
                 beginIdx += count;
                 continue;
             }
-            GM_ADDR infoAddr = 0;
-            uint32_t srcRankId = index;
-            uint32_t localExpertId = 0;
             if (isShareExpert) {
-                infoAddr = GetLocalSharedInfoAddr(index, 0);
-            } else {
-                srcRankId = index % epRankSize;
-                localExpertId = index / epRankSize;
-                infoAddr = GetLocalMoeInfoAddr(srcRankId, localExpertId, 0);
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
-            for (uint32_t j = 0; j < count; j++) {
-                tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(infoAddr + j * hCommuSize));
-                expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
-
-                uint32_t payloadOffset = 0;
-                while (true) {
-                    AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-                    if (tmpLocalTensor.GetValue(1) == tokenFlag) {
-                        payloadOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
-                        tokGlobalInt32.SetValue(0, 0);
-                        tokGlobalInt32.SetValue(1, 0);
-                        __asm__ __volatile__("");
-                        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                                          AscendC::DcciDst::CACHELINE_OUT>(tokGlobalInt32[0]);
-                        __asm__ __volatile__("");
-                        break;
-                    }
-                }
-                AscendC::PipeBarrier<PIPE_ALL>();
-
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
-                tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
-                AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-                AscendC::DataCopyPad(dynamicScalesOutGMTensor_[beginIdx + j], xOutFp32Tensor_[tokenLength / sizeof(float)],
-                                    dataCopyParamsFloat);
-                AscendC::DataCopy(expandXOutGlobal, xTmpTensor_, tokenLength);
+                GM_ADDR infoAddr = GetLocalSharedInfoAddr(index, 0);
+                uint32_t srcRankId = index;
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                for (uint32_t j = 0; j < count; j++) {
+                    tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(infoAddr + j * hCommuSize));
+                    expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
+
+                    uint32_t payloadOffset = 0;
+                    while (true) {
+                        AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+                        if (tmpLocalTensor.GetValue(1) == tokenFlag) {
+                            payloadOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
+                            tokGlobalInt32.SetValue(0, 0);
+                            tokGlobalInt32.SetValue(1, 0);
+                            __asm__ __volatile__("");
+                            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                              AscendC::DcciDst::CACHELINE_OUT>(tokGlobalInt32[0]);
+                            __asm__ __volatile__("");
+                            break;
+                        }
+                    }
+                    AscendC::PipeBarrier<PIPE_ALL>();
+
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                    tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
+                    AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+                    AscendC::DataCopyPad(dynamicScalesOutGMTensor_[beginIdx + j],
+                                        xOutFp32Tensor_[tokenLength / sizeof(float)], dataCopyParamsFloat);
+                    AscendC::DataCopy(expandXOutGlobal, xTmpTensor_, tokenLength);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                }
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+            } else {
+                uint32_t srcRankId = index % epRankSize;
+                uint32_t localExpertId = index / epRankSize;
+                GM_ADDR infoAddr = GetLocalMoeInfoHeaderAddr(srcRankId, localExpertId);
+                uint32_t payloadBaseOffset = 0;
+                if (count > 0) {
+                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, tmpLocalTensor);
+                }
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                uint32_t processed = 0;
+                while (processed < count) {
+                    uint32_t chunkTokens = count - processed;
+                    if (chunkTokens > recvPullChunkTokens) {
+                        chunkTokens = recvPullChunkTokens;
+                    }
+                    uint32_t chunkPayloadOffset = payloadBaseOffset + processed * hCommuSize;
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                    tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, chunkPayloadOffset));
+                    AscendC::DataCopy(xTmpTensor_, tokGlobal, chunkTokens * axisHCommu);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+                    for (uint32_t chunkIdx = 0; chunkIdx < chunkTokens; ++chunkIdx) {
+                        uint32_t localPayloadOffset = chunkIdx * axisHCommu;
+                        uint32_t outTokenIndex = beginIdx + processed + chunkIdx;
+                        expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + outTokenIndex * tokenLength,
+                                                         tokenLength);
+                        AscendC::DataCopyPad(
+                            dynamicScalesOutGMTensor_[outTokenIndex],
+                            xOutFp32Tensor_[(localPayloadOffset + tokenLength) / sizeof(float)],
+                            dataCopyParamsFloat);
+                        AscendC::DataCopy(expandXOutGlobal, xTmpTensor_[localPayloadOffset], tokenLength);
+                    }
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                    processed += chunkTokens;
+                }
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                if (count > 0) {
+                    ClearMoeGroupInfoReady(infoAddr);
+                }
             }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             beginIdx += count;
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -1719,6 +1848,13 @@ public:
         scaleParamPad = TOKEN_EXTRA_SPACE;  // 512B for dynamic quant scale
         hCommuSize = hOutSize + scaleParamPad;
         axisHCommu = hCommuSize / sizeof(int8_t);
+        recvPullChunkTokens = RECV_PULL_CHUNK_BYTES / hCommuSize;
+        if (recvPullChunkTokens == 0) {
+            recvPullChunkTokens = 1;
+        }
+        if (recvPullChunkTokens > MAX_RECV_PULL_CHUNK_TOKENS) {
+            recvPullChunkTokens = MAX_RECV_PULL_CHUNK_TOKENS;
+        }
         axisBS = params.bs;
         activeMaskBsCnt = axisBS;
         axisK = params.topK;
@@ -1727,7 +1863,7 @@ public:
         uint32_t maxAxisBs = params.globalBs / epRankSize;
 
         stateOffset = STATE_OFFSET;
-        expertPerSizeOnWin = maxAxisBs * tokenLength * sizeof(XType);
+        expertPerSizeOnWin = maxAxisBs * hCommuSize;
         winInfoBytesPerState = params.winInfoBytesPerState;
         winExportOffset = params.winExportOffset;
         winExportBytesPerState = params.winExportBytesPerState;
@@ -2076,6 +2212,7 @@ private:
     uint32_t scaleParamPad{0};
     uint32_t hCommuSize{0};
     uint32_t axisHCommu{0};
+    uint32_t recvPullChunkTokens{1};
     uint32_t axisBS{0};
     uint32_t activeMaskBsCnt{0};
     uint32_t axisK{0};
