@@ -24,7 +24,10 @@ namespace {
 constexpr uint32_t OP_TYPE_ALL_TO_ALL = 8;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t GM_ALIGN_SIZE = 512;
+constexpr uint32_t WINDOW_RANK_OFFSET = 512;
+constexpr uint32_t DOUBLE_DATA_BUFFER = 2;
 constexpr uint32_t TOKEN_DTYPE_BYTE_SIZE = 2;
+constexpr uint32_t DYNAMIC_QUANT_SCALE_PAD = 512;
 constexpr uint32_t L1_TILE_BYTE_SIZE = 32 * 1024;
 constexpr uint32_t CUBE_WORKSPACE_STAGE = 4;
 constexpr uint32_t RESERVED_WORKSPACE_SIZE = 256 * 1024;
@@ -436,6 +439,58 @@ static ge::graphStatus SetWorkSpace(gert::TilingContext *context, const char *no
     return ge::GRAPH_SUCCESS;
 }
 
+static ge::graphStatus SetWindowLayout(const char *nodeName, DispatchGmmCombineDecodeTilingData &tilingData)
+{
+    auto &info = tilingData.disGmmDeqSwigluQuantGmmDeqComInfo;
+    info.winInfoBytesPerState = 0;
+    info.winExportOffset = 0;
+    info.winExportBytesPerState = 0;
+    info.winDataBytesPerState = 0;
+    info.totalWinSize = 0;
+
+    if (info.isBf16Fp16W || info.moeExpertNumPerRank == 1) {
+        return ge::GRAPH_SUCCESS;
+    }
+
+    uint64_t epRankSize = static_cast<uint64_t>(info.epRankSize);
+    uint64_t moeExpertNumPerRank = static_cast<uint64_t>(info.moeExpertNumPerRank);
+    uint64_t maxBatchSize = static_cast<uint64_t>(info.globalBs) / epRankSize;
+    uint64_t batchSize = static_cast<uint64_t>(info.bs);
+    uint64_t topK = static_cast<uint64_t>(info.k);
+    uint64_t h = static_cast<uint64_t>(info.h);
+    uint64_t expertPerSizeOnWin = maxBatchSize * h * TOKEN_DTYPE_BYTE_SIZE;
+    uint64_t oldDataWindowBytesPerState = epRankSize * moeExpertNumPerRank * expertPerSizeOnWin;
+    uint64_t hCommuSize = h + DYNAMIC_QUANT_SCALE_PAD;
+    uint64_t exportTokenSlots = batchSize * topK;
+    if (info.sharedExpertRankNum > 0) {
+        exportTokenSlots += batchSize;
+    }
+    uint64_t exportBytesPerState = CeilUp(exportTokenSlots * hCommuSize, GM_ALIGN_SIZE);
+    OPS_ERR_IF(exportBytesPerState > 0x7fffffffUL,
+               OPS_LOG_E(nodeName,
+                         "w8a8 dynamic export window is too large for 32-bit info offsets, exportBytesPerState=%lu.",
+                         exportBytesPerState),
+               return ge::GRAPH_FAILED);
+    uint64_t dataBytesPerState = oldDataWindowBytesPerState + exportBytesPerState;
+    uint64_t totalWinSize = dataBytesPerState * DOUBLE_DATA_BUFFER;
+    uint64_t requiredWindowSize = totalWinSize + (epRankSize - 1) * WINDOW_RANK_OFFSET;
+    uint64_t maxWindowSize = Mc2TilingUtils::GetMaxWindowSize();
+
+    OPS_ERR_IF(requiredWindowSize > maxWindowSize,
+               OPS_LOG_E(nodeName,
+                         "HCCL_BUFFSIZE is too small for w8a8 dynamic export window, required=%lu bytes, "
+                         "available=%lu bytes, infoBytesPerState=%lu, exportBytesPerState=%lu.",
+                         requiredWindowSize, maxWindowSize, oldDataWindowBytesPerState, exportBytesPerState),
+               return ge::GRAPH_FAILED);
+
+    info.winInfoBytesPerState = oldDataWindowBytesPerState;
+    info.winExportOffset = oldDataWindowBytesPerState;
+    info.winExportBytesPerState = exportBytesPerState;
+    info.winDataBytesPerState = dataBytesPerState;
+    info.totalWinSize = totalWinSize;
+    return ge::GRAPH_SUCCESS;
+}
+
 static ge::graphStatus DispatchGmmCombineDecodeTilingFuncImpl(gert::TilingContext *context)
 {
     const char *nodeName = context->GetNodeName();
@@ -478,6 +533,8 @@ static ge::graphStatus DispatchGmmCombineDecodeTilingFuncImpl(gert::TilingContex
             OPS_LOG_E(nodeName, "CheckXActiveMaskShape failed."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(SetWorkSpace(context, nodeName, *tilingData) != ge::GRAPH_SUCCESS,
             OPS_LOG_E(nodeName, "Tiling set workspace failed."), return ge::GRAPH_FAILED);
+    OPS_ERR_IF(SetWindowLayout(nodeName, *tilingData) != ge::GRAPH_SUCCESS,
+            OPS_LOG_E(nodeName, "Tiling set window layout failed."), return ge::GRAPH_FAILED);
     SetHcommCfg(context, tilingData, groupEp);
     const gert::StorageShape* xActiveMaskStorageShape = context->GetOptionalInputShape(
                     INPUT_SHARE_X_ACTIVE_MASK_INDEX);

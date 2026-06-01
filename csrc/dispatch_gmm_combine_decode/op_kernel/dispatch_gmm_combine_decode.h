@@ -67,7 +67,9 @@ CATLASS_DEVICE void GmmDeqSwigluQuant(GemmCoord problemShape, uint32_t groupCoun
                                   GM_ADDR gmEpSendCount, GM_ADDR xActiveMask, GM_ADDR gmResvered, GM_ADDR gmExpertTokenNums,
                                   uint32_t epRankSize, uint32_t epRankId, uint32_t moeExpertNum,
                                   uint32_t moeExpertNumPerRank, uint32_t sharedExpertNum, uint32_t sharedExpertRankNum,
-                                  uint32_t quantMode, uint32_t globalBs, uint32_t bs, uint32_t topK, uint32_t tokenLen)
+                                  uint32_t quantMode, uint32_t globalBs, uint32_t bs, uint32_t topK, uint32_t tokenLen,
+                                  uint64_t winInfoBytesPerState, uint64_t winExportOffset,
+                                  uint64_t winExportBytesPerState, uint64_t winDataBytesPerState)
 {
     using ArchTag = Arch::AtlasA2;
     using DispatchPolicy = DispatchPolicy_;
@@ -151,7 +153,11 @@ CATLASS_DEVICE void GmmDeqSwigluQuant(GemmCoord problemShape, uint32_t groupCoun
                                            globalBs,
                                            bs,
                                            topK,
-                                           tokenLen};
+                                           tokenLen,
+                                           winInfoBytesPerState,
+                                           winExportOffset,
+                                           winExportBytesPerState,
+                                           winDataBytesPerState};
         // call a kernel
         GemmKernel gemm;
         gemm(params);
@@ -288,6 +294,10 @@ private:
     uint32_t bs_{0};
     uint32_t maxBs_{0};
     uint32_t topK_{0};
+    uint64_t winInfoBytesPerState_{0};
+    uint64_t winExportOffset_{0};
+    uint64_t winExportBytesPerState_{0};
+    uint64_t winDataBytesPerState_{0};
 
     AscendC::TPipe *tpipe_{nullptr};
     __gm__ HcclOpResParam *winContext_{nullptr};
@@ -332,6 +342,10 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Init(
     globalBs_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.globalBs;
     bs_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.bs;
     topK_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.k;
+    winInfoBytesPerState_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.winInfoBytesPerState;
+    winExportOffset_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.winExportOffset;
+    winExportBytesPerState_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.winExportBytesPerState;
+    winDataBytesPerState_ = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo.winDataBytesPerState;
     maxBs_ = globalBs_ / epRankSize_;
 
     bool isShareExpert = (epRankId_ < sharedExpertRankNum_);
@@ -432,7 +446,8 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
         gmPermuteScale1_, layoutW1Scale, gmX1Scale, layoutX1Scale, gmX2, layoutX2, gmX2Scale,
         layoutX2Scale, gmWorkspace, gmX_, gmSmoothScales_, gmexpertIds_, gmExpandIdx, gmEpSendCount, xActiveMask_, gmResvered,
         gmExpertTokenNums_, epRankSize_, epRankId_, moeExpertNum_, moeExpertNumPerRank_, sharedExpertNum_,
-        sharedExpertRankNum_, quantMode_, globalBs_, bs_, topK_, tokenHiddenSize_);
+        sharedExpertRankNum_, quantMode_, globalBs_, bs_, topK_, tokenHiddenSize_, winInfoBytesPerState_,
+        winExportOffset_, winExportBytesPerState_, winDataBytesPerState_);
     AscendC::PipeBarrier<PIPE_ALL>();
     Arch::CrossCoreFlag gmm1AivFinished{0};
     if constexpr (g_coreType == AscendC::AIV) {

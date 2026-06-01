@@ -344,6 +344,10 @@ public:
         uint32_t bs;
         uint32_t topK;
         uint32_t tokenLen;
+        uint64_t winInfoBytesPerState;
+        uint64_t winExportOffset;
+        uint64_t winExportBytesPerState;
+        uint64_t winDataBytesPerState;
         // Methods
         CATLASS_DEVICE
         Params() {}
@@ -358,7 +362,8 @@ public:
                GM_ADDR gmResvered_, GM_ADDR gmExpertTokenNums_, uint32_t epRankSize_, uint32_t epRankId_,
                uint32_t moeExpertNum_, uint32_t moeExpertNumPerRank_, uint32_t sharedExpertNum_,
                uint32_t sharedExpertRankNum_, uint32_t quantMode_, uint32_t globalBs_, uint32_t bs_, uint32_t topK_,
-               uint32_t h)
+               uint32_t h, uint64_t winInfoBytesPerState_, uint64_t winExportOffset_,
+               uint64_t winExportBytesPerState_, uint64_t winDataBytesPerState_)
             : problemShape(problemShape_),
               problemCount(problemCount_),
               ptrGroupList(reinterpret_cast<__gm__ ElementGroupList *>(ptrGroupList_)),
@@ -393,7 +398,11 @@ public:
               globalBs(globalBs_),
               bs(bs_),
               topK(topK_),
-              tokenLen(h)
+              tokenLen(h),
+              winInfoBytesPerState(winInfoBytesPerState_),
+              winExportOffset(winExportOffset_),
+              winExportBytesPerState(winExportBytesPerState_),
+              winDataBytesPerState(winDataBytesPerState_)
         {}
     };
 
@@ -790,46 +799,45 @@ public:
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetLocalMoeStagingAddr(uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal)
+    uint32_t GetMoeExportPayloadOffset(uint32_t tokenIndex)
     {
-        return GET_WIND_ADDR_BY_RANK_ID(epRankId) +
-               (dstRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize;
+        return static_cast<uint32_t>(static_cast<uint64_t>(tokenIndex) * hCommuSize);
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetLocalSharedStagingAddr(uint32_t dstRankId, uint32_t ordinal)
+    uint32_t GetSharedExportPayloadOffset(uint32_t tokenIndex)
     {
-        return GET_WIND_ADDR_BY_RANK_ID(epRankId) + dstRankId * expertPerSizeOnWin + ordinal * hCommuSize;
+        uint64_t moeExportBytes = static_cast<uint64_t>(axisBS) * axisK * hCommuSize;
+        return static_cast<uint32_t>(moeExportBytes + static_cast<uint64_t>(tokenIndex) * hCommuSize);
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetRemoteMoeStagingAddr(uint32_t srcRankId, uint32_t localExpertId, uint32_t ordinal)
+    GM_ADDR GetLocalExportPayloadAddr(uint32_t payloadOffset)
     {
-        return GET_WIND_ADDR_BY_RANK_ID(srcRankId) +
-               (epRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize;
+        return GET_WIND_ADDR_BY_RANK_ID(epRankId) + winExportOffset + payloadOffset;
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetRemoteSharedStagingAddr(uint32_t srcRankId, uint32_t ordinal)
+    GM_ADDR GetRemoteExportPayloadAddr(uint32_t srcRankId, uint32_t payloadOffset)
     {
-        return GET_WIND_ADDR_BY_RANK_ID(srcRankId) + epRankId * expertPerSizeOnWin + ordinal * hCommuSize;
+        return GET_WIND_ADDR_BY_RANK_ID(srcRankId) + winExportOffset + payloadOffset;
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetRemoteMoeTokenFlagAddr(uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal)
+    GM_ADDR GetRemoteMoeInfoAddr(uint32_t dstRankId, uint32_t localExpertId, uint32_t ordinal)
     {
         return GET_WIND_ADDR_BY_RANK_ID(dstRankId) +
                (epRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize + hOutSize;
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetRemoteSharedTokenFlagAddr(uint32_t dstRankId, uint32_t ordinal)
+    GM_ADDR GetRemoteSharedInfoAddr(uint32_t dstRankId, uint32_t ordinal)
     {
         return GET_WIND_ADDR_BY_RANK_ID(dstRankId) + epRankId * expertPerSizeOnWin + ordinal * hCommuSize + hOutSize;
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetLocalMoeTokenFlagAddr(uint32_t srcRankId, uint32_t localExpertId, uint32_t ordinal)
+    GM_ADDR GetLocalMoeInfoAddr(uint32_t srcRankId, uint32_t localExpertId, uint32_t ordinal)
     {
         return GET_WIND_ADDR_BY_RANK_ID(epRankId) +
                (srcRankId * moeExpertNumPerRank + localExpertId) * expertPerSizeOnWin + ordinal * hCommuSize +
@@ -837,23 +845,24 @@ public:
     }
 
     CATLASS_DEVICE
-    GM_ADDR GetLocalSharedTokenFlagAddr(uint32_t srcRankId, uint32_t ordinal)
+    GM_ADDR GetLocalSharedInfoAddr(uint32_t srcRankId, uint32_t ordinal)
     {
         return GET_WIND_ADDR_BY_RANK_ID(epRankId) + srcRankId * expertPerSizeOnWin + ordinal * hCommuSize + hOutSize;
     }
 
     CATLASS_DEVICE
-    void PublishRemoteTokenFlag(GM_ADDR flagGM, int32_t eventId)
+    void PublishRemotePayloadInfo(GM_ADDR infoGM, uint32_t payloadOffset, int32_t eventId)
     {
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(eventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
-        AscendC::GlobalTensor<int32_t> flagTensor;
-        flagTensor.SetGlobalBuffer((__gm__ int32_t *)(flagGM + sizeof(int32_t)));
-        flagTensor.SetValue(0, tokenFlag);
+        AscendC::GlobalTensor<int32_t> infoTensor;
+        infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
+        infoTensor.SetValue(0, static_cast<int32_t>(payloadOffset));
+        infoTensor.SetValue(1, tokenFlag);
         __asm__ __volatile__("");
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(
-            flagTensor[0]);
+            infoTensor[0]);
         __asm__ __volatile__("");
     }
 
@@ -1050,13 +1059,14 @@ public:
                 AscendC::DataCopyPad(dynamicScalesOutGMTensor_[tokenIndex],
                                         yFp32Tensor[index][tokenLength / sizeof(float)], dataCopyParamsFloat);
             } else {
-                GM_ADDR rankGM = GetLocalSharedStagingAddr(moeOnShareRank, tokenIndex - preCnt);
+                uint32_t payloadOffset = GetSharedExportPayloadOffset(tokenIndex);
+                GM_ADDR rankGM = GetLocalExportPayloadAddr(payloadOffset);
                 dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
-                GM_ADDR flagGM = GetRemoteSharedTokenFlagAddr(moeOnShareRank, tokenIndex - preCnt);
-                PublishRemoteTokenFlag(flagGM, eventId);
+                GM_ADDR infoGM = GetRemoteSharedInfoAddr(moeOnShareRank, tokenIndex - preCnt);
+                PublishRemotePayloadInfo(infoGM, payloadOffset, eventId);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1127,8 +1137,8 @@ public:
                 CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, ubOffset);
                 expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
                 uint32_t tempRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
-                GM_ADDR rankGM =
-                    GetLocalMoeStagingAddr(tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt);
+                uint32_t payloadOffset = GetMoeExportPayloadOffset(tokenIndex);
+                GM_ADDR rankGM = GetLocalExportPayloadAddr(payloadOffset);
                 dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventId);
@@ -1145,8 +1155,8 @@ public:
                 AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength], scaleParamPad);
-                GM_ADDR flagGM = GetRemoteMoeTokenFlagAddr(tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt);
-                PublishRemoteTokenFlag(flagGM, eventId);
+                GM_ADDR infoGM = GetRemoteMoeInfoAddr(tempRankId, dstExpertId % moeExpertNumPerRank, curExpertCnt);
+                PublishRemotePayloadInfo(infoGM, payloadOffset, eventId);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
             }
@@ -1329,34 +1339,33 @@ public:
                 beginIdx += count;
                 continue;
             }
-            GM_ADDR wAddr = 0;
-            GM_ADDR flagAddr = 0;
+            GM_ADDR infoAddr = 0;
             uint32_t srcRankId = index;
             uint32_t localExpertId = 0;
             if (isShareExpert) {
-                wAddr = GetRemoteSharedStagingAddr(index, 0);
-                flagAddr = GetLocalSharedTokenFlagAddr(index, 0);
+                infoAddr = GetLocalSharedInfoAddr(index, 0);
             } else {
                 srcRankId = index % epRankSize;
                 localExpertId = index / epRankSize;
-                wAddr = GetRemoteMoeStagingAddr(srcRankId, localExpertId, 0);
-                flagAddr = GetLocalMoeTokenFlagAddr(srcRankId, localExpertId, 0);
+                infoAddr = GetLocalMoeInfoAddr(srcRankId, localExpertId, 0);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             for (uint32_t j = 0; j < count; j++) {
-                tokGlobal.SetGlobalBuffer((__gm__ int8_t *)(wAddr + j * hCommuSize));
-                tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(flagAddr + j * hCommuSize));
+                tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(infoAddr + j * hCommuSize));
                 expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
 
+                uint32_t payloadOffset = 0;
                 while (true) {
                     AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
                     if (tmpLocalTensor.GetValue(1) == tokenFlag) {
+                        payloadOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
+                        tokGlobalInt32.SetValue(0, 0);
                         tokGlobalInt32.SetValue(1, 0);
                         __asm__ __volatile__("");
                         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                                          AscendC::DcciDst::CACHELINE_OUT>(tokGlobalInt32[1]);
+                                                          AscendC::DcciDst::CACHELINE_OUT>(tokGlobalInt32[0]);
                         __asm__ __volatile__("");
                         break;
                     }
@@ -1364,6 +1373,7 @@ public:
                 AscendC::PipeBarrier<PIPE_ALL>();
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+                tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
                 AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
@@ -1718,6 +1728,10 @@ public:
 
         stateOffset = STATE_OFFSET;
         expertPerSizeOnWin = maxAxisBs * tokenLength * sizeof(XType);
+        winInfoBytesPerState = params.winInfoBytesPerState;
+        winExportOffset = params.winExportOffset;
+        winExportBytesPerState = params.winExportBytesPerState;
+        winDataBytesPerState = params.winDataBytesPerState;
         winContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
         statusDataSpaceGm = (GM_ADDR)(winContext_->localWindowsExp);
         quantReadyBase = params.gmResvered;
@@ -1794,7 +1808,7 @@ public:
         __asm__ __volatile__("");
 
         AscendC::PipeBarrier<PIPE_ALL>();
-        winDataSizeOffset = dataState * epRankSize * expertPerSizeOnWin * moeExpertNumPerRank;
+        winDataSizeOffset = dataState * winDataBytesPerState;
         GM_ADDR statusSpaceGm_ = GET_WIND_STATE_ADDR_BY_RANK_ID(epRankId);
         AscendC::GlobalTensor<int32_t> selfStatusTensor;
         selfStatusTensor.SetGlobalBuffer((__gm__ int32_t *)(statusSpaceGm_ + SELF_STATE_OFFSET));
@@ -2082,6 +2096,10 @@ private:
     GM_ADDR statusDataSpaceGm;
     uint32_t stateOffset{0};
     uint64_t expertPerSizeOnWin{0};
+    uint64_t winInfoBytesPerState{0};
+    uint64_t winExportOffset{0};
+    uint64_t winExportBytesPerState{0};
+    uint64_t winDataBytesPerState{0};
     uint64_t winDataSizeOffset{0};
 
     int64_t ubOffset;
