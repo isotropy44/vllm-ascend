@@ -9,6 +9,7 @@
  */
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 #include "log/ops_log.h"
@@ -24,6 +25,9 @@ namespace {
 constexpr uint32_t OP_TYPE_ALL_TO_ALL = 8;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t GM_ALIGN_SIZE = 512;
+constexpr uint64_t MB_SIZE = 1024UL * 1024UL;
+constexpr uint32_t DEFAULT_HCCL_BUFFSIZE_MB = 200;
+constexpr char HCCL_BUFFSIZE_ENV[] = "HCCL_BUFFSIZE";
 constexpr uint32_t WINDOW_RANK_OFFSET = 512;
 constexpr uint32_t DOUBLE_DATA_BUFFER = 2;
 constexpr uint32_t TOKEN_DTYPE_BYTE_SIZE = 2;
@@ -70,6 +74,26 @@ namespace optiling {
 static size_t CeilUp(size_t x, size_t y)
 {
     return (x + y - 1) / y * y;
+}
+
+static uint64_t GetMaxWindowSize()
+{
+    uint64_t buffSizeMb = DEFAULT_HCCL_BUFFSIZE_MB;
+    const char *envValue = std::getenv(HCCL_BUFFSIZE_ENV);
+    if (envValue == nullptr) {
+        OPS_LOG_D("", "Env HCCL_BUFFSIZE don't set");
+    } else {
+        char *end = nullptr;
+        unsigned long parsed = std::strtoul(envValue, &end, 10);
+        if (end != envValue && *end == '\0') {
+            buffSizeMb = static_cast<uint64_t>(parsed);
+        } else {
+            OPS_LOG_E("", "Invalid argument when parsing HCCL_BUFFSIZE: %s", envValue);
+        }
+    }
+    uint64_t maxWindowSize = buffSizeMb * MB_SIZE;
+    OPS_LOG_I("", "Get maxWindowSize is %lu", static_cast<unsigned long>(maxWindowSize));
+    return maxWindowSize;
 }
 
 static uint32_t CountTensorListLen(gert::TilingContext *context, int descIndex)
@@ -474,7 +498,7 @@ static ge::graphStatus SetWindowLayout(const char *nodeName, DispatchGmmCombineD
     uint64_t dataBytesPerState = oldDataWindowBytesPerState + exportBytesPerState;
     uint64_t totalWinSize = dataBytesPerState * DOUBLE_DATA_BUFFER;
     uint64_t requiredWindowSize = totalWinSize + (epRankSize - 1) * WINDOW_RANK_OFFSET;
-    uint64_t maxWindowSize = Mc2TilingUtils::GetMaxWindowSize();
+    uint64_t maxWindowSize = GetMaxWindowSize();
 
     OPS_ERR_IF(requiredWindowSize > maxWindowSize,
                OPS_LOG_E(nodeName,
