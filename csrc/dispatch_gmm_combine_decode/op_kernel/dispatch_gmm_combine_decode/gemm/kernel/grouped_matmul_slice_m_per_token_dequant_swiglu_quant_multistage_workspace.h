@@ -22,6 +22,14 @@
 
 #include "../../../dispatch_gmm_combine_decode_base.h"
 
+#ifndef DISPATCH_GMM_PULL_DEBUG
+#define DISPATCH_GMM_PULL_DEBUG 1
+#endif
+
+#ifndef DGCD_DEBUG_SPIN_INTERVAL
+#define DGCD_DEBUG_SPIN_INTERVAL (1U << 20)
+#endif
+
 namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
@@ -572,14 +580,28 @@ public:
             groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
                                                      groupIdx * GROUP_INFO_SIZE);
             // wait AIV recv needed tokens
+#if DISPATCH_GMM_PULL_DEBUG
+            uint32_t aicWaitSpin = 0;
+#endif
+            uint32_t waitTarget = GetRecvCompCoreCount(groupIdx) * vToCFlag;
             while (true) {
                 __asm__ __volatile__("");
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
+                uint32_t currentFlag = groupTokenNumStateTensor.GetValue(0);
+                if (currentFlag == waitTarget) {
                     break;
                 }
+#if DISPATCH_GMM_PULL_DEBUG
+                ++aicWaitSpin;
+                if ((aicWaitSpin & (DGCD_DEBUG_SPIN_INTERVAL - 1)) == 0) {
+                    AscendC::printf("[dgcd-pull-debug][aic-wait] ep=%u aic=%u group=%u current=%u target=%u tokenCount=%u vToC=%d expectedRecv=%u\n",
+                                    epRankId, aicIdx, groupIdx, currentFlag, waitTarget,
+                                    groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT), vToCFlag,
+                                    GetRecvCompCoreCount(groupIdx));
+                }
+#endif
             }
 
             uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
@@ -908,13 +930,21 @@ public:
 
     CATLASS_DEVICE
     uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum,
-                                   AscendC::LocalTensor<int32_t> &tmpLocalTensor)
+                                   AscendC::LocalTensor<int32_t> &tmpLocalTensor, uint32_t srcRankId,
+                                   uint32_t localExpertId, uint32_t count, uint32_t beginIdx)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
         uint32_t payloadBaseOffset = 0;
+#if DISPATCH_GMM_PULL_DEBUG
+        uint32_t moeWaitSpin = 0;
+#endif
         while (true) {
             bool ready = true;
+#if DISPATCH_GMM_PULL_DEBUG
+            ++moeWaitSpin;
+            bool debugPrint = ((moeWaitSpin & (DGCD_DEBUG_SPIN_INTERVAL - 1)) == 0);
+#endif
             AscendC::DataCopy(tmpLocalTensor, infoTensor[0], INT32_COUNT_PER_BLOCK);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
@@ -924,8 +954,17 @@ public:
                 AscendC::DataCopy(tmpLocalTensor, infoTensor[flagSlot], INT32_COUNT_PER_BLOCK);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-                if (tmpLocalTensor.GetValue(0) != tokenFlag) {
+                int32_t flagValue = tmpLocalTensor.GetValue(0);
+                if (flagValue != tokenFlag) {
                     ready = false;
+#if DISPATCH_GMM_PULL_DEBUG
+                    if (debugPrint) {
+                        AscendC::printf("[dgcd-pull-debug][moe-wait] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u sendIdx=%u flagSlot=%u value=%d tokenFlag=%d payloadBase=%u\n",
+                                        epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
+                                        expectedSendToMoeAivNum, sendIdx, flagSlot, flagValue, tokenFlag,
+                                        payloadBaseOffset);
+                    }
+#endif
                 }
             }
             if (ready) {
@@ -1471,6 +1510,9 @@ public:
                     expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
 
                     uint32_t payloadOffset = 0;
+#if DISPATCH_GMM_PULL_DEBUG
+                    uint32_t sharedWaitSpin = 0;
+#endif
                     while (true) {
                         AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
@@ -1485,6 +1527,14 @@ public:
                             __asm__ __volatile__("");
                             break;
                         }
+#if DISPATCH_GMM_PULL_DEBUG
+                        ++sharedWaitSpin;
+                        if ((sharedWaitSpin & (DGCD_DEBUG_SPIN_INTERVAL - 1)) == 0) {
+                            AscendC::printf("[dgcd-pull-debug][shared-wait] ep=%u aiv=%u recvCore=%u src=%u ordinal=%u count=%u begin=%u info0=%d info1=%d tokenFlag=%d\n",
+                                            epRankId, aivIdx, recvCoreIdx, srcRankId, j, count, beginIdx,
+                                            tmpLocalTensor.GetValue(0), tmpLocalTensor.GetValue(1), tokenFlag);
+                        }
+#endif
                     }
                     AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -1506,7 +1556,13 @@ public:
                 uint32_t payloadBaseOffset = 0;
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
-                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor);
+                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor,
+                                                              srcRankId, localExpertId, count, beginIdx);
+#if DISPATCH_GMM_PULL_DEBUG
+                    AscendC::printf("[dgcd-pull-debug][moe-wait-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                                    epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
+                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+#endif
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 uint32_t processed = 0;
@@ -1538,6 +1594,11 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+#if DISPATCH_GMM_PULL_DEBUG
+                    AscendC::printf("[dgcd-pull-debug][moe-pull-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                                    epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
+                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+#endif
                     ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
                 }
             }
@@ -1617,6 +1678,11 @@ public:
         AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
         groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET));
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+#if DISPATCH_GMM_PULL_DEBUG
+        AscendC::printf("[dgcd-pull-debug][recv-finish] ep=%u aiv=%u recvCore=%u group=%u recvCompCore=%u coreTokenCount=%u vToC=%d expectedRecv=%u\n",
+                        epRankId, aivIdx, recvCoreIdx, groupId, recvCompCoreIdx, coreTokenCount, vToCFlag,
+                        GetRecvCompCoreCount(groupId));
+#endif
         AscendC::SetAtomicAdd<int32_t>();
         AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, INT32_COUNT_PER_BLOCK);
         AscendC::SetAtomicNone();
@@ -1724,14 +1790,28 @@ public:
                     // just like AIC
                     groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
                                                             groupIdx * GROUP_INFO_SIZE);
+#if DISPATCH_GMM_PULL_DEBUG
+                    uint32_t compWaitSpin = 0;
+#endif
+                    uint32_t target = GetRecvCompCoreCount(groupIdx) * vToCFlag;
                     while (true) {
                         __asm__ __volatile__("");
                         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                         AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                         __asm__ __volatile__("");
-                        if (groupTokenNumStateTensor.GetValue(0) == GetRecvCompCoreCount(groupIdx) * vToCFlag) {
+                        uint32_t currentFlag = groupTokenNumStateTensor.GetValue(0);
+                        if (currentFlag == target) {
                             break;
                         }
+#if DISPATCH_GMM_PULL_DEBUG
+                        ++compWaitSpin;
+                        if ((compWaitSpin & (DGCD_DEBUG_SPIN_INTERVAL - 1)) == 0) {
+                            AscendC::printf("[dgcd-pull-debug][comp-wait] ep=%u comp=%u producerAic=%u group=%u current=%u target=%u tokenCount=%u vToC=%d expectedRecv=%u\n",
+                                            epRankId, compCoreIdx, producerAicIdx, groupIdx, currentFlag, target,
+                                            groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT), vToCFlag,
+                                            GetRecvCompCoreCount(groupIdx));
+                        }
+#endif
                     }
                     uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
                     GemmCoord inGroupProblemShape{currentM, n, k};
@@ -2056,14 +2136,27 @@ public:
         groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
                                                 groupIdx * GROUP_INFO_SIZE);
         uint32_t target = GetRecvCompCoreCount(groupIdx) * vToCFlag;
+#if DISPATCH_GMM_PULL_DEBUG
+        uint32_t waitRecvCompSpin = 0;
+#endif
         while (true) {
             __asm__ __volatile__("");
             AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                             AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
             __asm__ __volatile__("");
-            if (groupTokenNumStateTensor.GetValue(0) == target) {
+            uint32_t currentFlag = groupTokenNumStateTensor.GetValue(0);
+            if (currentFlag == target) {
                 break;
             }
+#if DISPATCH_GMM_PULL_DEBUG
+            ++waitRecvCompSpin;
+            if ((waitRecvCompSpin & (DGCD_DEBUG_SPIN_INTERVAL - 1)) == 0) {
+                AscendC::printf("[dgcd-pull-debug][recv-comp-wait] ep=%u aiv=%u recvComp=%u group=%u current=%u target=%u tokenCount=%u vToC=%d expectedRecv=%u\n",
+                                epRankId, aivIdx, recvCompCoreIdx, groupIdx, currentFlag, target,
+                                groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT), vToCFlag,
+                                GetRecvCompCoreCount(groupIdx));
+            }
+#endif
         }
     }
 
