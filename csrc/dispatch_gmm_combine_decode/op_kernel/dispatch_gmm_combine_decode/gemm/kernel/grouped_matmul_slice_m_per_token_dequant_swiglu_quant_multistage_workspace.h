@@ -1294,13 +1294,6 @@ public:
 
         CalAndSendTokenCount();
         AscendC::PipeBarrier<PIPE_ALL>();
-        if (hasShareExpert) {
-            sendToShareAivNum = sendCoreNum / (axisK + 1);
-            if (sendToShareAivNum == 0) {
-                sendToShareAivNum = 1;
-            }
-        }
-        sendToMoeAivNum = sendCoreNum - sendToShareAivNum;
 
         AscendC::SetDeqScale((half)1.000000e+00f);
         if (hasShareExpert && sendCoreIdx >= sendToMoeAivNum) {
@@ -1309,6 +1302,19 @@ public:
             SendToMoeExprt(gmX, gmExpandIdx);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
+    void InitSendAivPartition()
+    {
+        sendToShareAivNum = 0;
+        if (hasShareExpert) {
+            sendToShareAivNum = sendCoreNum / (axisK + 1);
+            if (sendToShareAivNum == 0) {
+                sendToShareAivNum = 1;
+            }
+        }
+        sendToMoeAivNum = sendCoreNum - sendToShareAivNum;
     }
 
     CATLASS_DEVICE
@@ -1858,6 +1864,7 @@ public:
         axisBS = params.bs;
         activeMaskBsCnt = axisBS;
         axisK = params.topK;
+        InitSendAivPartition();
         tokenOrderMetadataWorkspaceBytes = GetTokenOrderMetadataWorkspaceBytes(params);
         enableTokenOrderMetadata = IsTokenOrderMetadataWorkspaceEnough(params);
         uint32_t maxAxisBs = params.globalBs / epRankSize;
