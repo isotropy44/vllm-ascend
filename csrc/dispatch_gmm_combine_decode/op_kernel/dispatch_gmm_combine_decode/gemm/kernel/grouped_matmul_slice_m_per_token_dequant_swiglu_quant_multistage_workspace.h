@@ -27,7 +27,7 @@
 #endif
 
 #ifndef DGCD_DEBUG_SPIN_INTERVAL
-#define DGCD_DEBUG_SPIN_INTERVAL (1U << 20)
+#define DGCD_DEBUG_SPIN_INTERVAL (1U << 10)
 #endif
 
 namespace Catlass::Gemm::Kernel {
@@ -584,6 +584,10 @@ public:
             uint32_t aicWaitSpin = 0;
 #endif
             uint32_t waitTarget = GetRecvCompCoreCount(groupIdx) * vToCFlag;
+#if DISPATCH_GMM_PULL_DEBUG
+            AscendC::printf("[dgcd-pull-debug][aic-wait-enter] ep=%u aic=%u group=%u target=%u vToC=%d expectedRecv=%u\n",
+                            epRankId, aicIdx, groupIdx, waitTarget, vToCFlag, GetRecvCompCoreCount(groupIdx));
+#endif
             while (true) {
                 __asm__ __volatile__("");
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
@@ -938,6 +942,9 @@ public:
         uint32_t payloadBaseOffset = 0;
 #if DISPATCH_GMM_PULL_DEBUG
         uint32_t moeWaitSpin = 0;
+        AscendC::printf("[dgcd-pull-debug][moe-wait-enter] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u tokenFlag=%d\n",
+                        epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
+                        expectedSendToMoeAivNum, tokenFlag);
 #endif
         while (true) {
             bool ready = true;
@@ -1512,6 +1519,8 @@ public:
                     uint32_t payloadOffset = 0;
 #if DISPATCH_GMM_PULL_DEBUG
                     uint32_t sharedWaitSpin = 0;
+                    AscendC::printf("[dgcd-pull-debug][shared-wait-enter] ep=%u aiv=%u recvCore=%u src=%u ordinal=%u count=%u begin=%u tokenFlag=%d\n",
+                                    epRankId, aivIdx, recvCoreIdx, srcRankId, j, count, beginIdx, tokenFlag);
 #endif
                     while (true) {
                         AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
@@ -1794,6 +1803,11 @@ public:
                     uint32_t compWaitSpin = 0;
 #endif
                     uint32_t target = GetRecvCompCoreCount(groupIdx) * vToCFlag;
+#if DISPATCH_GMM_PULL_DEBUG
+                    AscendC::printf("[dgcd-pull-debug][comp-wait-enter] ep=%u comp=%u producerAic=%u group=%u target=%u vToC=%d expectedRecv=%u\n",
+                                    epRankId, compCoreIdx, producerAicIdx, groupIdx, target, vToCFlag,
+                                    GetRecvCompCoreCount(groupIdx));
+#endif
                     while (true) {
                         __asm__ __volatile__("");
                         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
@@ -2138,6 +2152,9 @@ public:
         uint32_t target = GetRecvCompCoreCount(groupIdx) * vToCFlag;
 #if DISPATCH_GMM_PULL_DEBUG
         uint32_t waitRecvCompSpin = 0;
+        AscendC::printf("[dgcd-pull-debug][recv-comp-wait-enter] ep=%u aiv=%u recvComp=%u group=%u target=%u vToC=%d expectedRecv=%u\n",
+                        epRankId, aivIdx, recvCompCoreIdx, groupIdx, target, vToCFlag,
+                        GetRecvCompCoreCount(groupIdx));
 #endif
         while (true) {
             __asm__ __volatile__("");
@@ -2233,6 +2250,14 @@ public:
     {
         AivInitParams(params);
         AivInitState();
+#if DISPATCH_GMM_PULL_DEBUG
+        if (epRankId == 0 && aivIdx == 0) {
+            AscendC::printf("[dgcd-pull-debug][dgcd-pull-device-canary] ep=%u aiv=%u dataState=%u cvDataState=%u tokenFlag=%d vToC=%d localExpertNum=%u send=%u recvComp=%u comp=%u quant=%u\n",
+                            epRankId, aivIdx, dataState, cvDataState, tokenFlag, vToCFlag, localExpertNum,
+                            static_cast<uint32_t>(isSendCore), static_cast<uint32_t>(isRecvCompCore),
+                            static_cast<uint32_t>(isCompCore), static_cast<uint32_t>(isQuantCore));
+        }
+#endif
         PrintTokenOrderMetadataFallback();
         PrintQuantPipelineFallback(params);
         if (enableQuantPipeline) {
