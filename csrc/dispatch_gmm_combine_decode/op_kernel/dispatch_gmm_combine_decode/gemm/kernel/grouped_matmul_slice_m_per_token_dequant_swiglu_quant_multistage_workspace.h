@@ -862,6 +862,31 @@ public:
     }
 
     CATLASS_DEVICE
+    uint32_t GetMoeGroupFlagSlot(uint32_t moeSendCoreIdx)
+    {
+        return (moeSendCoreIdx + 1) * INT32_COUNT_PER_BLOCK;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetSourceMoeSendAivNum(uint32_t srcRankId)
+    {
+        uint32_t srcLocalExpertNum = (srcRankId < sharedExpertRankNum) ? 1 : moeExpertNumPerRank;
+        uint32_t srcSendCoreNum = aivNum;
+        if (srcLocalExpertNum > 1) {
+            srcSendCoreNum = aiCoreGroupNum;
+        }
+
+        uint32_t srcSendToShareAivNum = 0;
+        if (hasShareExpert) {
+            srcSendToShareAivNum = srcSendCoreNum / (axisK + 1);
+            if (srcSendToShareAivNum == 0) {
+                srcSendToShareAivNum = 1;
+            }
+        }
+        return srcSendCoreNum - srcSendToShareAivNum;
+    }
+
+    CATLASS_DEVICE
     void PublishRemoteMoeGroupInfo(GM_ADDR infoGM, uint32_t payloadBaseOffset, bool writePayloadOffset)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
@@ -873,7 +898,7 @@ public:
                                               AscendC::DcciDst::CACHELINE_OUT>(infoTensor[0]);
             __asm__ __volatile__("");
         }
-        uint32_t flagSlot = 1 + sendCoreIdx;
+        uint32_t flagSlot = GetMoeGroupFlagSlot(sendCoreIdx);
         infoTensor.SetValue(flagSlot, tokenFlag);
         __asm__ __volatile__("");
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
@@ -882,30 +907,25 @@ public:
     }
 
     CATLASS_DEVICE
-    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, AscendC::LocalTensor<int32_t> &tmpLocalTensor)
+    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum,
+                                   AscendC::LocalTensor<int32_t> &tmpLocalTensor)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
         uint32_t payloadBaseOffset = 0;
         while (true) {
             bool ready = true;
-            for (uint32_t slotBase = 0; slotBase <= sendToMoeAivNum; slotBase += INT32_COUNT_PER_BLOCK) {
-                AscendC::DataCopy(tmpLocalTensor, infoTensor[slotBase], INT32_COUNT_PER_BLOCK);
+            AscendC::DataCopy(tmpLocalTensor, infoTensor[0], INT32_COUNT_PER_BLOCK);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+            payloadBaseOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
+            for (uint32_t sendIdx = 0; sendIdx < expectedSendToMoeAivNum; ++sendIdx) {
+                uint32_t flagSlot = GetMoeGroupFlagSlot(sendIdx);
+                AscendC::DataCopy(tmpLocalTensor, infoTensor[flagSlot], INT32_COUNT_PER_BLOCK);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-                if (slotBase == 0) {
-                    payloadBaseOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
-                }
-                uint32_t slotEnd = slotBase + INT32_COUNT_PER_BLOCK;
-                uint32_t maxSlot = sendToMoeAivNum + 1;
-                if (slotEnd > maxSlot) {
-                    slotEnd = maxSlot;
-                }
-                uint32_t slot = (slotBase == 0) ? 1 : slotBase;
-                for (; slot < slotEnd; ++slot) {
-                    if (tmpLocalTensor.GetValue(slot - slotBase) != tokenFlag) {
-                        ready = false;
-                    }
+                if (tmpLocalTensor.GetValue(0) != tokenFlag) {
+                    ready = false;
                 }
             }
             if (ready) {
@@ -916,15 +936,16 @@ public:
     }
 
     CATLASS_DEVICE
-    void ClearMoeGroupInfoReady(GM_ADDR infoGM)
+    void ClearMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
-        for (uint32_t slot = 1; slot <= sendToMoeAivNum; ++slot) {
-            infoTensor.SetValue(slot, 0);
+        for (uint32_t sendIdx = 0; sendIdx < expectedSendToMoeAivNum; ++sendIdx) {
+            uint32_t flagSlot = GetMoeGroupFlagSlot(sendIdx);
+            infoTensor.SetValue(flagSlot, 0);
             __asm__ __volatile__("");
             AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                              AscendC::DcciDst::CACHELINE_OUT>(infoTensor[slot]);
+                                              AscendC::DcciDst::CACHELINE_OUT>(infoTensor[flagSlot]);
             __asm__ __volatile__("");
         }
     }
@@ -1484,7 +1505,8 @@ public:
                 GM_ADDR infoAddr = GetLocalMoeInfoHeaderAddr(srcRankId, localExpertId);
                 uint32_t payloadBaseOffset = 0;
                 if (count > 0) {
-                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, tmpLocalTensor);
+                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor);
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 uint32_t processed = 0;
@@ -1515,7 +1537,8 @@ public:
                 }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 if (count > 0) {
-                    ClearMoeGroupInfoReady(infoAddr);
+                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+                    ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
                 }
             }
             beginIdx += count;
