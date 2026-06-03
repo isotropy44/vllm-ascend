@@ -7,7 +7,6 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
-#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -559,16 +558,6 @@ static ge::graphStatus DispatchGmmCombineDecodeTilingFuncImpl(gert::TilingContex
             OPS_LOG_E(nodeName, "Tiling set workspace failed."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(SetWindowLayout(nodeName, *tilingData) != ge::GRAPH_SUCCESS,
             OPS_LOG_E(nodeName, "Tiling set window layout failed."), return ge::GRAPH_FAILED);
-    {
-        const auto &info = tilingData->disGmmDeqSwigluQuantGmmDeqComInfo;
-        std::fprintf(stderr,
-                     "[dgcd-pull-host-canary] node=%s ep=%u/%u bs=%u topK=%u h=%u "
-                     "winDataBytesPerState=%lu winExportOffset=%lu\n",
-                     nodeName, info.epRankId, info.epRankSize, info.bs, info.k, info.h,
-                     static_cast<unsigned long>(info.winDataBytesPerState),
-                     static_cast<unsigned long>(info.winExportOffset));
-        std::fflush(stderr);
-    }
     SetHcommCfg(context, tilingData, groupEp);
     const gert::StorageShape* xActiveMaskStorageShape = context->GetOptionalInputShape(
                     INPUT_SHARE_X_ACTIVE_MASK_INDEX);
