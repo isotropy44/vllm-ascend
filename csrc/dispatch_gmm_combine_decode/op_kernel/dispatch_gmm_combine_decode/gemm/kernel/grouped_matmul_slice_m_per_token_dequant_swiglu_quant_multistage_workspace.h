@@ -33,8 +33,9 @@
 #ifndef DGCD_DEVICE_FAIL_FAST_STAGE
 // Diagnostic only: 0=normal, 1=entry return, 2=after state init,
 // 30=after pre-send setup, 31=send-only, 32=send+recv-count,
-// 33=send+recv-cumsum, 34=send+recv-wait-only, 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 34
+// 33=send+recv-cumsum, 34=send+recv-wait-only,
+// 35=send+recv-wait-send0-only, 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 35
 #endif
 
 namespace Catlass::Gemm::Kernel {
@@ -554,7 +555,7 @@ public:
         }
 #if DGCD_DEVICE_FAIL_FAST_STAGE == 2 || DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 30 || \
     DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32 || DGCD_DEVICE_FAIL_FAST_STAGE == 33 || \
-    DGCD_DEVICE_FAIL_FAST_STAGE == 34
+    DGCD_DEVICE_FAIL_FAST_STAGE == 34 || DGCD_DEVICE_FAIL_FAST_STAGE == 35
         return;
 #endif
 
@@ -1524,6 +1525,10 @@ public:
                 continue;
             }
             if (isShareExpert) {
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+                beginIdx += count;
+                continue;
+#endif
                 GM_ADDR infoAddr = GetLocalSharedInfoAddr(index, 0);
                 uint32_t srcRankId = index;
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
@@ -1562,7 +1567,7 @@ public:
                     }
                     AscendC::PipeBarrier<PIPE_ALL>();
 
-#if DGCD_DEVICE_FAIL_FAST_STAGE != 34
+#if DGCD_DEVICE_FAIL_FAST_STAGE != 34 && DGCD_DEVICE_FAIL_FAST_STAGE != 35
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                     tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
                     AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
@@ -1582,6 +1587,9 @@ public:
                 uint32_t payloadBaseOffset = 0;
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+                    expectedSendToMoeAivNum = 1;
+#endif
                     payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor,
                                                               srcRankId, localExpertId, count, beginIdx);
 #if DISPATCH_GMM_PULL_DEBUG
@@ -1590,7 +1598,7 @@ public:
                                     expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
 #endif
                 }
-#if DGCD_DEVICE_FAIL_FAST_STAGE != 34
+#if DGCD_DEVICE_FAIL_FAST_STAGE != 34 && DGCD_DEVICE_FAIL_FAST_STAGE != 35
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 uint32_t processed = 0;
                 while (processed < count) {
@@ -1631,6 +1639,9 @@ public:
 #else
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+                    expectedSendToMoeAivNum = 1;
+#endif
                     ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
                 }
 #endif
@@ -2354,7 +2365,7 @@ public:
         if (isRecvCompCore) {
             RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount);
         }
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 34
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 34 || DGCD_DEVICE_FAIL_FAST_STAGE == 35
         return;
 #endif
 
