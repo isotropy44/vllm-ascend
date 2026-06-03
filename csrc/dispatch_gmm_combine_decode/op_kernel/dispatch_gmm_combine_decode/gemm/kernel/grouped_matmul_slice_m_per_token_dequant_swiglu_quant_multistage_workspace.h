@@ -30,6 +30,10 @@
 #define DGCD_DEBUG_SPIN_INTERVAL (1U << 10)
 #endif
 
+#ifndef DGCD_DEVICE_FAIL_FAST_CANARY
+#define DGCD_DEVICE_FAIL_FAST_CANARY 1
+#endif
+
 namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
@@ -509,6 +513,9 @@ public:
         aicIdx = AscendC::GetBlockIdx();
         subBlockNum = AscendC::GetSubBlockNum();
         aiCoreGroupNum = AscendC::GetBlockNum();
+#if DGCD_DEVICE_FAIL_FAST_CANARY
+        return;
+#endif
         aicNum = aiCoreGroupNum;
         aivNum = aiCoreGroupNum * SUB_AIV_NUM;
         aicStateGlobalCoreIdx = aivNum + aicIdx;
@@ -2249,6 +2256,9 @@ public:
     CATLASS_DEVICE void operator()<AscendC::AIV>(Params const &params)
     {
         AivInitParams(params);
+#if DGCD_DEVICE_FAIL_FAST_CANARY
+        return;
+#endif
         AivInitState();
 #if DISPATCH_GMM_PULL_DEBUG
         if (epRankId == 0 && aivIdx == 0) {
