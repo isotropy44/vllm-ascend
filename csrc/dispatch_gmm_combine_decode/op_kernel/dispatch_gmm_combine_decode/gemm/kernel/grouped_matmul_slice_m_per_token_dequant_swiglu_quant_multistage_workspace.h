@@ -32,8 +32,9 @@
 
 #ifndef DGCD_DEVICE_FAIL_FAST_STAGE
 // Diagnostic only: 0=normal, 1=entry return, 2=after state init,
-// 30=after pre-send setup, 31=send-only, 32=send+recv-count, 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 32
+// 30=after pre-send setup, 31=send-only, 32=send+recv-count,
+// 33=send+recv-cumsum, 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 33
 #endif
 
 namespace Catlass::Gemm::Kernel {
@@ -552,7 +553,7 @@ public:
             vToCFlag = V_TO_C_FLAG_2;
         }
 #if DGCD_DEVICE_FAIL_FAST_STAGE == 2 || DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 30 || \
-    DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32
+    DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32 || DGCD_DEVICE_FAIL_FAST_STAGE == 33
         return;
 #endif
 
@@ -2302,6 +2303,37 @@ public:
         if (isRecvCompCore) {
             ubOffset = 0;
             RecvCount(ubOffset);
+        }
+        return;
+#endif
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 33
+        if (isSendCore) {
+            SendCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
+                        (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx, (GM_ADDR)params.gmXActiveMask);
+        }
+        if (isRecvCompCore) {
+            ubOffset = 0;
+            RecvCount(ubOffset);
+
+            uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
+            uint32_t groupId = 0;
+            uint32_t recvCoreIdxInGroup = 0;
+            uint32_t recvCoreNumPerGroup = 0;
+            if (GetRecvCompAssignment(recvCompCoreIdx, groupId, recvCoreIdxInGroup, recvCoreNumPerGroup)) {
+                uint32_t recvRankNumPerCore = epRankSize / recvCoreNumPerGroup;
+                uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
+                uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;
+                if (recvCoreIdxInGroup < remainderRankNum) {
+                    recvRankNumPerCore += 1;
+                    startRankIdInGroup += recvCoreIdxInGroup;
+                } else {
+                    startRankIdInGroup += remainderRankNum;
+                }
+                uint32_t startRankId = epRankSize * groupId + startRankIdInGroup;
+                if (startRankId < recvExpertNum) {
+                    GetCumSum(startRankId, recvExpertNum, ubOffset);
+                }
+            }
         }
         return;
 #endif
