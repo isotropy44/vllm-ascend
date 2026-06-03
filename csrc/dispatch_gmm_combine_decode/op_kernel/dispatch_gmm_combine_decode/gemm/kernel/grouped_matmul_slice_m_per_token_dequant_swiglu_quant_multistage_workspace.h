@@ -931,9 +931,16 @@ public:
         counterTensor.SetValue(0, 1);
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+        uint32_t counterSlot = GetMoeGroupDoneCounterSlot();
         AscendC::SetAtomicAdd<int32_t>();
-        AscendC::DataCopy(infoTensor[GetMoeGroupDoneCounterSlot()], counterTensor, INT32_COUNT_PER_BLOCK);
+        AscendC::DataCopy(infoTensor[counterSlot], counterTensor, INT32_COUNT_PER_BLOCK);
         AscendC::SetAtomicNone();
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[counterSlot]);
+        __asm__ __volatile__("");
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -964,7 +971,14 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
             int32_t doneCounter = tmpLocalTensor.GetValue(0);
-            if (doneCounter == static_cast<int32_t>(expectedSendToMoeAivNum)) {
+            if (doneCounter >= static_cast<int32_t>(expectedSendToMoeAivNum)) {
+#if DISPATCH_GMM_PULL_DEBUG
+                if (doneCounter > static_cast<int32_t>(expectedSendToMoeAivNum)) {
+                    AscendC::printf("[dgcd-pull-debug][moe-counter-overrun] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u doneCounter=%d tokenFlag=%d payloadBase=%u\n",
+                                    epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
+                                    expectedSendToMoeAivNum, doneCounter, tokenFlag, payloadBaseOffset);
+                }
+#endif
                 break;
             }
 #if DISPATCH_GMM_PULL_DEBUG
