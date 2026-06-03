@@ -30,8 +30,9 @@
 #define DGCD_DEBUG_SPIN_INTERVAL (1U << 10)
 #endif
 
-#ifndef DGCD_DEVICE_FAIL_FAST_CANARY
-#define DGCD_DEVICE_FAIL_FAST_CANARY 1
+#ifndef DGCD_DEVICE_FAIL_FAST_STAGE
+// Diagnostic only: 0=normal, 1=entry return, 2=after state init, 3=after send/recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 2
 #endif
 
 namespace Catlass::Gemm::Kernel {
@@ -513,7 +514,7 @@ public:
         aicIdx = AscendC::GetBlockIdx();
         subBlockNum = AscendC::GetSubBlockNum();
         aiCoreGroupNum = AscendC::GetBlockNum();
-#if DGCD_DEVICE_FAIL_FAST_CANARY
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 1
         return;
 #endif
         aicNum = aiCoreGroupNum;
@@ -549,6 +550,9 @@ public:
             selfDataStatusTensor(aicStateGlobalCoreIdx * UB_ALIGN) = 0;
             vToCFlag = V_TO_C_FLAG_2;
         }
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 2 || DGCD_DEVICE_FAIL_FAST_STAGE == 3
+        return;
+#endif
 
         BlockScheduler blockScheduler;
         BlockMmad blockMmad(resource);
@@ -2256,10 +2260,13 @@ public:
     CATLASS_DEVICE void operator()<AscendC::AIV>(Params const &params)
     {
         AivInitParams(params);
-#if DGCD_DEVICE_FAIL_FAST_CANARY
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 1
         return;
 #endif
         AivInitState();
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 2
+        return;
+#endif
 #if DISPATCH_GMM_PULL_DEBUG
         if (epRankId == 0 && aivIdx == 0) {
             AscendC::printf("[dgcd-pull-debug][dgcd-pull-device-canary] ep=%u aiv=%u dataState=%u cvDataState=%u tokenFlag=%d vToC=%d localExpertNum=%u send=%u recvComp=%u comp=%u quant=%u\n",
@@ -2282,6 +2289,9 @@ public:
         if (isRecvCompCore) {
             RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount);
         }
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 3
+        return;
+#endif
 
         auto gmSwigluOutput = reinterpret_cast<__gm__ float *>(
             params.ptrWorkspace + sizeof(int32_t) * (L1TileShape::M * aiCoreGroupNum * WORKSPACE_STAGES * L1TileShape::N));
