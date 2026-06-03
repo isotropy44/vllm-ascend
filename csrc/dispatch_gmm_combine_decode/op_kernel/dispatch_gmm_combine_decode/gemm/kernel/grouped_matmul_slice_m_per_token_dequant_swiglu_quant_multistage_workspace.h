@@ -35,11 +35,12 @@
 // 30=after pre-send setup, 31=send-only, 32=send+recv-count,
 // 33=send+recv-cumsum, 34=send+recv-wait-only,
 // 35=send+recv-wait-send0-only, 36=send+recv-wait-send0-1-only,
-// 37=send+recv-wait-send1-only, 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 37
+// 37=send+recv-wait-send1-only, 38=send0-publishes-send1-flag,
+// 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 38
 #endif
 
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 37
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 37 || DGCD_DEVICE_FAIL_FAST_STAGE == 38
 #define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN 1
 #define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 1
 #elif DGCD_DEVICE_FAIL_FAST_STAGE == 35
@@ -977,6 +978,11 @@ public:
             __asm__ __volatile__("");
         }
         uint32_t flagSlot = GetMoeGroupFlagSlot(sendCoreIdx);
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 38
+        if (sendCoreIdx == 0) {
+            flagSlot = GetMoeGroupFlagSlot(1);
+        }
+#endif
         infoTensor.SetValue(flagSlot, tokenFlag);
         __asm__ __volatile__("");
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
