@@ -35,15 +35,21 @@
 // 30=after pre-send setup, 31=send-only, 32=send+recv-count,
 // 33=send+recv-cumsum, 34=send+recv-wait-only,
 // 35=send+recv-wait-send0-only, 36=send+recv-wait-send0-1-only,
-// 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 36
+// 37=send+recv-wait-send1-only, 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 37
 #endif
 
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 37
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN 1
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 1
+#elif DGCD_DEVICE_FAIL_FAST_STAGE == 35
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN 0
 #define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 1
 #elif DGCD_DEVICE_FAIL_FAST_STAGE == 36
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN 0
 #define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 2
 #else
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN 0
 #define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 0
 #endif
 
@@ -941,6 +947,24 @@ public:
     }
 
     CATLASS_DEVICE
+    void GetMoeGroupWaitRange(uint32_t srcRankId, uint32_t &firstSendIdx, uint32_t &sendAivNum)
+    {
+        firstSendIdx = 0;
+        sendAivNum = GetSourceMoeSendAivNum(srcRankId);
+#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
+        firstSendIdx = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_BEGIN;
+        if (sendAivNum <= firstSendIdx) {
+            sendAivNum = 0;
+            return;
+        }
+        sendAivNum -= firstSendIdx;
+        if (sendAivNum > DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM) {
+            sendAivNum = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM;
+        }
+#endif
+    }
+
+    CATLASS_DEVICE
     void PublishRemoteMoeGroupInfo(GM_ADDR infoGM, uint32_t payloadBaseOffset, bool writePayloadOffset)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
@@ -961,7 +985,7 @@ public:
     }
 
     CATLASS_DEVICE
-    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum,
+    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, uint32_t firstSendIdx, uint32_t waitSendToMoeAivNum,
                                    AscendC::LocalTensor<int32_t> &tmpLocalTensor, uint32_t srcRankId,
                                    uint32_t localExpertId, uint32_t count, uint32_t beginIdx)
     {
@@ -970,9 +994,9 @@ public:
         uint32_t payloadBaseOffset = 0;
 #if DISPATCH_GMM_PULL_DEBUG
         uint32_t moeWaitSpin = 0;
-        AscendC::printf("[dgcd-pull-debug][moe-wait-enter] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u tokenFlag=%d\n",
+        AscendC::printf("[dgcd-pull-debug][moe-wait-enter] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u firstSend=%u expected=%u tokenFlag=%d\n",
                         epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                        expectedSendToMoeAivNum, tokenFlag);
+                        firstSendIdx, waitSendToMoeAivNum, tokenFlag);
 #endif
         while (true) {
             bool ready = true;
@@ -984,7 +1008,8 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
             payloadBaseOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
-            for (uint32_t sendIdx = 0; sendIdx < expectedSendToMoeAivNum; ++sendIdx) {
+            for (uint32_t sendOffset = 0; sendOffset < waitSendToMoeAivNum; ++sendOffset) {
+                uint32_t sendIdx = firstSendIdx + sendOffset;
                 uint32_t flagSlot = GetMoeGroupFlagSlot(sendIdx);
                 AscendC::DataCopy(tmpLocalTensor, infoTensor[flagSlot], INT32_COUNT_PER_BLOCK);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
@@ -994,9 +1019,9 @@ public:
                     ready = false;
 #if DISPATCH_GMM_PULL_DEBUG
                     if (debugPrint) {
-                        AscendC::printf("[dgcd-pull-debug][moe-wait] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u sendIdx=%u flagSlot=%u value=%d tokenFlag=%d payloadBase=%u\n",
+                        AscendC::printf("[dgcd-pull-debug][moe-wait] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u firstSend=%u expected=%u sendIdx=%u flagSlot=%u value=%d tokenFlag=%d payloadBase=%u\n",
                                         epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                        expectedSendToMoeAivNum, sendIdx, flagSlot, flagValue, tokenFlag,
+                                        firstSendIdx, waitSendToMoeAivNum, sendIdx, flagSlot, flagValue, tokenFlag,
                                         payloadBaseOffset);
                     }
 #endif
@@ -1010,11 +1035,12 @@ public:
     }
 
     CATLASS_DEVICE
-    void ClearMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum)
+    void ClearMoeGroupInfoReady(GM_ADDR infoGM, uint32_t firstSendIdx, uint32_t sendAivNum)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
-        for (uint32_t sendIdx = 0; sendIdx < expectedSendToMoeAivNum; ++sendIdx) {
+        for (uint32_t sendOffset = 0; sendOffset < sendAivNum; ++sendOffset) {
+            uint32_t sendIdx = firstSendIdx + sendOffset;
             uint32_t flagSlot = GetMoeGroupFlagSlot(sendIdx);
             infoTensor.SetValue(flagSlot, 0);
             __asm__ __volatile__("");
@@ -1597,19 +1623,16 @@ public:
                 uint32_t localExpertId = index / epRankSize;
                 GM_ADDR infoAddr = GetLocalMoeInfoHeaderAddr(srcRankId, localExpertId);
                 uint32_t payloadBaseOffset = 0;
+                uint32_t firstSendIdx = 0;
+                uint32_t waitSendToMoeAivNum = 0;
                 if (count > 0) {
-                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
-#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
-                    if (expectedSendToMoeAivNum > DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM) {
-                        expectedSendToMoeAivNum = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM;
-                    }
-#endif
-                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor,
+                    GetMoeGroupWaitRange(srcRankId, firstSendIdx, waitSendToMoeAivNum);
+                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, firstSendIdx, waitSendToMoeAivNum, tmpLocalTensor,
                                                               srcRankId, localExpertId, count, beginIdx);
 #if DISPATCH_GMM_PULL_DEBUG
-                    AscendC::printf("[dgcd-pull-debug][moe-wait-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                    AscendC::printf("[dgcd-pull-debug][moe-wait-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u firstSend=%u expected=%u payloadBase=%u tokenFlag=%d\n",
                                     epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+                                    firstSendIdx, waitSendToMoeAivNum, payloadBaseOffset, tokenFlag);
 #endif
                 }
 #if !DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY
@@ -1642,23 +1665,16 @@ public:
                 }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 if (count > 0) {
-                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
 #if DISPATCH_GMM_PULL_DEBUG
-                    AscendC::printf("[dgcd-pull-debug][moe-pull-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                    AscendC::printf("[dgcd-pull-debug][moe-pull-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u firstSend=%u expected=%u payloadBase=%u tokenFlag=%d\n",
                                     epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+                                    firstSendIdx, waitSendToMoeAivNum, payloadBaseOffset, tokenFlag);
 #endif
-                    ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
+                    ClearMoeGroupInfoReady(infoAddr, firstSendIdx, waitSendToMoeAivNum);
                 }
 #else
                 if (count > 0) {
-                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
-#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
-                    if (expectedSendToMoeAivNum > DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM) {
-                        expectedSendToMoeAivNum = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM;
-                    }
-#endif
-                    ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
+                    ClearMoeGroupInfoReady(infoAddr, firstSendIdx, waitSendToMoeAivNum);
                 }
 #endif
             }
