@@ -33,8 +33,8 @@
 #ifndef DGCD_DEVICE_FAIL_FAST_STAGE
 // Diagnostic only: 0=normal, 1=entry return, 2=after state init,
 // 30=after pre-send setup, 31=send-only, 32=send+recv-count,
-// 33=send+recv-cumsum, 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 33
+// 33=send+recv-cumsum, 34=send+recv-wait-only, 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 34
 #endif
 
 namespace Catlass::Gemm::Kernel {
@@ -553,7 +553,8 @@ public:
             vToCFlag = V_TO_C_FLAG_2;
         }
 #if DGCD_DEVICE_FAIL_FAST_STAGE == 2 || DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 30 || \
-    DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32 || DGCD_DEVICE_FAIL_FAST_STAGE == 33
+    DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32 || DGCD_DEVICE_FAIL_FAST_STAGE == 33 || \
+    DGCD_DEVICE_FAIL_FAST_STAGE == 34
         return;
 #endif
 
@@ -1561,6 +1562,7 @@ public:
                     }
                     AscendC::PipeBarrier<PIPE_ALL>();
 
+#if DGCD_DEVICE_FAIL_FAST_STAGE != 34
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                     tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
                     AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
@@ -1570,6 +1572,7 @@ public:
                                         xOutFp32Tensor_[tokenLength / sizeof(float)], dataCopyParamsFloat);
                     AscendC::DataCopy(expandXOutGlobal, xTmpTensor_, tokenLength);
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+#endif
                 }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             } else {
@@ -1587,6 +1590,7 @@ public:
                                     expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
 #endif
                 }
+#if DGCD_DEVICE_FAIL_FAST_STAGE != 34
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 uint32_t processed = 0;
                 while (processed < count) {
@@ -1624,6 +1628,12 @@ public:
 #endif
                     ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
                 }
+#else
+                if (count > 0) {
+                    uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
+                    ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
+                }
+#endif
             }
             beginIdx += count;
         }
@@ -2344,7 +2354,7 @@ public:
         if (isRecvCompCore) {
             RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount);
         }
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 3
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 34
         return;
 #endif
 
