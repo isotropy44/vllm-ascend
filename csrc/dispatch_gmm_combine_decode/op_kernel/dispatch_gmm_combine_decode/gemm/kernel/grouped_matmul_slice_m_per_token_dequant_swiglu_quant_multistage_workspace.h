@@ -34,9 +34,21 @@
 // Diagnostic only: 0=normal, 1=entry return, 2=after state init,
 // 30=after pre-send setup, 31=send-only, 32=send+recv-count,
 // 33=send+recv-cumsum, 34=send+recv-wait-only,
-// 35=send+recv-wait-send0-only, 3=send+recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 35
+// 35=send+recv-wait-send0-only, 36=send+recv-wait-send0-1-only,
+// 3=send+recv.
+#define DGCD_DEVICE_FAIL_FAST_STAGE 36
 #endif
+
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 1
+#elif DGCD_DEVICE_FAIL_FAST_STAGE == 36
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 2
+#else
+#define DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM 0
+#endif
+
+#define DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY \
+    (DGCD_DEVICE_FAIL_FAST_STAGE == 34 || DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0)
 
 namespace Catlass::Gemm::Kernel {
 
@@ -555,7 +567,7 @@ public:
         }
 #if DGCD_DEVICE_FAIL_FAST_STAGE == 2 || DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 30 || \
     DGCD_DEVICE_FAIL_FAST_STAGE == 31 || DGCD_DEVICE_FAIL_FAST_STAGE == 32 || DGCD_DEVICE_FAIL_FAST_STAGE == 33 || \
-    DGCD_DEVICE_FAIL_FAST_STAGE == 34 || DGCD_DEVICE_FAIL_FAST_STAGE == 35
+    DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY
         return;
 #endif
 
@@ -1525,7 +1537,7 @@ public:
                 continue;
             }
             if (isShareExpert) {
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
+#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
                 beginIdx += count;
                 continue;
 #endif
@@ -1567,7 +1579,7 @@ public:
                     }
                     AscendC::PipeBarrier<PIPE_ALL>();
 
-#if DGCD_DEVICE_FAIL_FAST_STAGE != 34 && DGCD_DEVICE_FAIL_FAST_STAGE != 35
+#if !DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                     tokGlobal.SetGlobalBuffer((__gm__ int8_t *)GetRemoteExportPayloadAddr(srcRankId, payloadOffset));
                     AscendC::DataCopy(xTmpTensor_, tokGlobal, axisHCommu);
@@ -1587,8 +1599,10 @@ public:
                 uint32_t payloadBaseOffset = 0;
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
-                    expectedSendToMoeAivNum = 1;
+#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
+                    if (expectedSendToMoeAivNum > DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM) {
+                        expectedSendToMoeAivNum = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM;
+                    }
 #endif
                     payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor,
                                                               srcRankId, localExpertId, count, beginIdx);
@@ -1598,7 +1612,7 @@ public:
                                     expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
 #endif
                 }
-#if DGCD_DEVICE_FAIL_FAST_STAGE != 34 && DGCD_DEVICE_FAIL_FAST_STAGE != 35
+#if !DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 uint32_t processed = 0;
                 while (processed < count) {
@@ -1639,8 +1653,10 @@ public:
 #else
                 if (count > 0) {
                     uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 35
-                    expectedSendToMoeAivNum = 1;
+#if DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM > 0
+                    if (expectedSendToMoeAivNum > DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM) {
+                        expectedSendToMoeAivNum = DGCD_DEVICE_FAIL_FAST_MOE_WAIT_SEND_AIV_NUM;
+                    }
 #endif
                     ClearMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum);
                 }
@@ -2365,7 +2381,7 @@ public:
         if (isRecvCompCore) {
             RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount);
         }
-#if DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_STAGE == 34 || DGCD_DEVICE_FAIL_FAST_STAGE == 35
+#if DGCD_DEVICE_FAIL_FAST_STAGE == 3 || DGCD_DEVICE_FAIL_FAST_RECV_WAIT_ONLY
         return;
 #endif
 
