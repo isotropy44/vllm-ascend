@@ -888,65 +888,71 @@ public:
     }
 
     CATLASS_DEVICE
-    uint32_t GetMoeGroupDoneCounterSlot()
+    uint32_t GetMoeGroupReadyFlagSlot()
     {
         return INT32_COUNT_PER_BLOCK;
     }
 
     CATLASS_DEVICE
-    uint32_t GetSourceMoeSendAivNum(uint32_t srcRankId)
+    int32_t GetMoeGroupStageValue(uint32_t stageIdx)
     {
-        uint32_t srcLocalExpertNum = (srcRankId < sharedExpertRankNum) ? 1 : moeExpertNumPerRank;
-        uint32_t srcSendCoreNum = aivNum;
-        if (srcLocalExpertNum > 1) {
-            srcSendCoreNum = aiCoreGroupNum;
-        }
-
-        uint32_t srcSendToShareAivNum = 0;
-        if (hasShareExpert) {
-            srcSendToShareAivNum = srcSendCoreNum / (axisK + 1);
-            if (srcSendToShareAivNum == 0) {
-                srcSendToShareAivNum = 1;
-            }
-        }
-        return srcSendCoreNum - srcSendToShareAivNum;
+        return tokenFlag + static_cast<int32_t>(stageIdx);
     }
 
     CATLASS_DEVICE
-    void PublishRemoteMoeGroupInfo(GM_ADDR infoGM, uint32_t payloadBaseOffset, bool writePayloadOffset,
-                                   AscendC::LocalTensor<int32_t> &counterTensor)
+    void StoreMoeGroupReadyFlag(AscendC::GlobalTensor<int32_t> &infoTensor, int32_t flagValue)
+    {
+        uint32_t readySlot = GetMoeGroupReadyFlagSlot();
+        infoTensor.SetValue(readySlot, flagValue);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[readySlot]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    void WaitMoeGroupStage(GM_ADDR infoGM, int32_t expectedValue, AscendC::LocalTensor<int32_t> &tmpLocalTensor)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
-        if (writePayloadOffset) {
+        while (true) {
+            AscendC::DataCopy(tmpLocalTensor, infoTensor[GetMoeGroupReadyFlagSlot()], INT32_COUNT_PER_BLOCK);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+            if (tmpLocalTensor.GetValue(0) == expectedValue) {
+                break;
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void PublishRemoteMoeGroupInfo(GM_ADDR infoGM, uint32_t payloadBaseOffset,
+                                   AscendC::LocalTensor<int32_t> &tmpLocalTensor)
+    {
+        AscendC::GlobalTensor<int32_t> infoTensor;
+        infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
+        if (sendCoreIdx == 0) {
             infoTensor.SetValue(0, static_cast<int32_t>(payloadBaseOffset));
             __asm__ __volatile__("");
             AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                               AscendC::DcciDst::CACHELINE_OUT>(infoTensor[0]);
             __asm__ __volatile__("");
+        } else {
+            WaitMoeGroupStage(infoGM, GetMoeGroupStageValue(sendCoreIdx), tmpLocalTensor);
         }
-        for (uint32_t i = 0; i < INT32_COUNT_PER_BLOCK; ++i) {
-            counterTensor.SetValue(i, 0);
+
+        int32_t nextFlagValue = tokenFlag;
+        if (sendCoreIdx + 1 < sendToMoeAivNum) {
+            nextFlagValue = GetMoeGroupStageValue(sendCoreIdx + 1);
         }
-        counterTensor.SetValue(0, 1);
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-        uint32_t counterSlot = GetMoeGroupDoneCounterSlot();
-        AscendC::SetAtomicAdd<int32_t>();
-        AscendC::DataCopy(infoTensor[counterSlot], counterTensor, INT32_COUNT_PER_BLOCK);
-        AscendC::SetAtomicNone();
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
-        __asm__ __volatile__("");
-        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[counterSlot]);
-        __asm__ __volatile__("");
+        StoreMoeGroupReadyFlag(infoTensor, nextFlagValue);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     CATLASS_DEVICE
-    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, uint32_t expectedSendToMoeAivNum,
-                                   AscendC::LocalTensor<int32_t> &tmpLocalTensor, uint32_t srcRankId,
+    uint32_t WaitMoeGroupInfoReady(GM_ADDR infoGM, AscendC::LocalTensor<int32_t> &tmpLocalTensor, uint32_t srcRankId,
                                    uint32_t localExpertId, uint32_t count, uint32_t beginIdx)
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
@@ -954,9 +960,9 @@ public:
         uint32_t payloadBaseOffset = 0;
 #if DISPATCH_GMM_PULL_DEBUG
         uint32_t moeWaitSpin = 0;
-        AscendC::printf("[dgcd-pull-debug][moe-wait-enter] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u tokenFlag=%d\n",
+        AscendC::printf("[dgcd-pull-debug][moe-wait-enter] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u tokenFlag=%d\n",
                         epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                        expectedSendToMoeAivNum, tokenFlag);
+                        tokenFlag);
 #endif
         while (true) {
 #if DISPATCH_GMM_PULL_DEBUG
@@ -967,25 +973,18 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
             payloadBaseOffset = static_cast<uint32_t>(tmpLocalTensor.GetValue(0));
-            AscendC::DataCopy(tmpLocalTensor, infoTensor[GetMoeGroupDoneCounterSlot()], INT32_COUNT_PER_BLOCK);
+            AscendC::DataCopy(tmpLocalTensor, infoTensor[GetMoeGroupReadyFlagSlot()], INT32_COUNT_PER_BLOCK);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-            int32_t doneCounter = tmpLocalTensor.GetValue(0);
-            if (doneCounter >= static_cast<int32_t>(expectedSendToMoeAivNum)) {
-#if DISPATCH_GMM_PULL_DEBUG
-                if (doneCounter > static_cast<int32_t>(expectedSendToMoeAivNum)) {
-                    AscendC::printf("[dgcd-pull-debug][moe-counter-overrun] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u doneCounter=%d tokenFlag=%d payloadBase=%u\n",
-                                    epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                    expectedSendToMoeAivNum, doneCounter, tokenFlag, payloadBaseOffset);
-                }
-#endif
+            int32_t readyFlag = tmpLocalTensor.GetValue(0);
+            if (readyFlag == tokenFlag) {
                 break;
             }
 #if DISPATCH_GMM_PULL_DEBUG
             if (debugPrint) {
-                AscendC::printf("[dgcd-pull-debug][moe-wait] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u doneCounter=%d tokenFlag=%d payloadBase=%u\n",
+                AscendC::printf("[dgcd-pull-debug][moe-wait] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u readyFlag=%d tokenFlag=%d payloadBase=%u\n",
                                 epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                expectedSendToMoeAivNum, doneCounter, tokenFlag, payloadBaseOffset);
+                                readyFlag, tokenFlag, payloadBaseOffset);
             }
 #endif
         }
@@ -997,11 +996,11 @@ public:
     {
         AscendC::GlobalTensor<int32_t> infoTensor;
         infoTensor.SetGlobalBuffer((__gm__ int32_t *)infoGM);
-        uint32_t counterSlot = GetMoeGroupDoneCounterSlot();
-        infoTensor.SetValue(counterSlot, 0);
+        uint32_t readySlot = GetMoeGroupReadyFlagSlot();
+        infoTensor.SetValue(readySlot, 0);
         __asm__ __volatile__("");
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[counterSlot]);
+                                          AscendC::DcciDst::CACHELINE_OUT>(infoTensor[readySlot]);
         __asm__ __volatile__("");
     }
 
@@ -1237,7 +1236,7 @@ public:
         ubOffset += CEIL_UP(moeExpertNum * sizeof(int32_t));
         AscendC::LocalTensor<int32_t> groupBaseTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
         ubOffset += CEIL_UP(moeExpertNum * sizeof(int32_t));
-        AscendC::LocalTensor<int32_t> moeDoneCounterTensor =
+        AscendC::LocalTensor<int32_t> moeStageFlagTensor =
             resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset);
         ubOffset += CEIL_UP(UB_BLOCK_SIZE);
         for (uint32_t expertIndex = 0; expertIndex < moeExpertNum; ++expertIndex) {
@@ -1329,7 +1328,7 @@ public:
                 uint32_t payloadBaseOffset =
                     static_cast<uint32_t>(static_cast<uint64_t>(groupBaseTensor(dstExpertId)) * hCommuSize);
                 GM_ADDR infoGM = GetRemoteMoeInfoHeaderAddr(dstRankId, sendGroupIndex);
-                PublishRemoteMoeGroupInfo(infoGM, payloadBaseOffset, sendCoreIdx == 0, moeDoneCounterTensor);
+                PublishRemoteMoeGroupInfo(infoGM, payloadBaseOffset, moeStageFlagTensor);
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
@@ -1575,14 +1574,13 @@ public:
                 uint32_t localExpertId = index / epRankSize;
                 GM_ADDR infoAddr = GetLocalMoeInfoHeaderAddr(srcRankId, localExpertId);
                 uint32_t payloadBaseOffset = 0;
-                uint32_t expectedSendToMoeAivNum = GetSourceMoeSendAivNum(srcRankId);
                 if (count > 0) {
-                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, expectedSendToMoeAivNum, tmpLocalTensor,
-                                                              srcRankId, localExpertId, count, beginIdx);
+                    payloadBaseOffset = WaitMoeGroupInfoReady(infoAddr, tmpLocalTensor, srcRankId, localExpertId, count,
+                                                              beginIdx);
 #if DISPATCH_GMM_PULL_DEBUG
-                    AscendC::printf("[dgcd-pull-debug][moe-wait-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                    AscendC::printf("[dgcd-pull-debug][moe-wait-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u payloadBase=%u tokenFlag=%d\n",
                                     epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+                                    payloadBaseOffset, tokenFlag);
 #endif
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
@@ -1615,9 +1613,9 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
                 if (count > 0) {
 #if DISPATCH_GMM_PULL_DEBUG
-                    AscendC::printf("[dgcd-pull-debug][moe-pull-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u expected=%u payloadBase=%u tokenFlag=%d\n",
+                    AscendC::printf("[dgcd-pull-debug][moe-pull-done] ep=%u aiv=%u recvCore=%u src=%u localExp=%u count=%u begin=%u payloadBase=%u tokenFlag=%d\n",
                                     epRankId, aivIdx, recvCoreIdx, srcRankId, localExpertId, count, beginIdx,
-                                    expectedSendToMoeAivNum, payloadBaseOffset, tokenFlag);
+                                    payloadBaseOffset, tokenFlag);
 #endif
                     ClearMoeGroupInfoReady(infoAddr);
                 }
