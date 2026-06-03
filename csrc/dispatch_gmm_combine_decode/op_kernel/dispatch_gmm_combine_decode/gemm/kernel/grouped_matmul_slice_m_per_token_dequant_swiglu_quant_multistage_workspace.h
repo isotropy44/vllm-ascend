@@ -32,7 +32,7 @@
 
 #ifndef DGCD_DEVICE_FAIL_FAST_STAGE
 // Diagnostic only: 0=normal, 1=entry return, 2=after state init, 3=after send/recv.
-#define DGCD_DEVICE_FAIL_FAST_STAGE 2
+#define DGCD_DEVICE_FAIL_FAST_STAGE 3
 #endif
 
 namespace Catlass::Gemm::Kernel {
