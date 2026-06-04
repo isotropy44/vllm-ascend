@@ -69,6 +69,11 @@ public:
         LayoutD layoutD;
         GM_ADDR ptrWorkspace;
         void *combiner;
+        GM_ADDR ptrExpertReady;
+        uint32_t expertReadyEpoch;
+        bool enableExpertPipeline;
+        uint32_t aicCoreOffset;
+        uint32_t aicCoreNum;
 
         // Methods
         CATLASS_DEVICE
@@ -78,7 +83,8 @@ public:
         Params(GemmCoord problemShape_, uint32_t problemCount_, GM_ADDR ptrGroupList_, GM_ADDR ptrA_, LayoutA layoutA_,
                GM_ADDR ptrB_, LayoutB layoutB_, GM_ADDR ptrScale_, LayoutScale layoutScale_, GM_ADDR ptrPerTokenScale_,
                LayoutPerTokenScale layoutPerTokenScale_, GM_ADDR ptrD_, LayoutD layoutD_, GM_ADDR ptrWorkspace_,
-               void *combiner_)
+               void *combiner_, GM_ADDR ptrExpertReady_ = 0, uint32_t expertReadyEpoch_ = 0,
+               bool enableExpertPipeline_ = false, uint32_t aicCoreOffset_ = 0, uint32_t aicCoreNum_ = 0)
             : problemShape(problemShape_),
               problemCount(problemCount_),
               ptrGroupList(reinterpret_cast<__gm__ ElementGroupList *>(ptrGroupList_)),
@@ -93,7 +99,12 @@ public:
               ptrD(reinterpret_cast<__gm__ ElementD *>(ptrD_)),
               layoutD(layoutD_),
               ptrWorkspace(ptrWorkspace_),
-              combiner(combiner_)
+              combiner(combiner_),
+              ptrExpertReady(ptrExpertReady_),
+              expertReadyEpoch(expertReadyEpoch_),
+              enableExpertPipeline(enableExpertPipeline_),
+              aicCoreOffset(aicCoreOffset_),
+              aicCoreNum(aicCoreNum_)
         {}
     };
 
@@ -113,6 +124,27 @@ public:
     template <int32_t CORE_TYPE = g_coreType>
     CATLASS_DEVICE void operator()(Params const &params);
 
+    CATLASS_DEVICE
+    void WaitExpertReady(Params const &params, uint32_t groupIdx)
+    {
+        if (!params.enableExpertPipeline) {
+            return;
+        }
+        AscendC::GlobalTensor<uint32_t> expertReadyTensor;
+        expertReadyTensor.SetGlobalBuffer((__gm__ uint32_t *)(params.ptrExpertReady +
+                                      groupIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+        while (true) {
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(expertReadyTensor[0]);
+            __asm__ __volatile__("");
+            if (expertReadyTensor.GetValue(0) == params.expertReadyEpoch) {
+                break;
+            }
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const &params)
     {
@@ -130,19 +162,27 @@ public:
         AscendC::GlobalTensor<ElementGroupList> groupList;
         groupList.SetGlobalBuffer(params.ptrGroupList);
 
-        uint32_t coreIdx = AscendC::GetBlockIdx();
-        uint32_t coreNum = AscendC::GetBlockNum();
+        uint32_t physicalCoreIdx = AscendC::GetBlockIdx();
+        uint32_t physicalCoreNum = AscendC::GetBlockNum();
+        uint32_t coreOffset = params.enableExpertPipeline ? params.aicCoreOffset : 0;
+        uint32_t coreNum = params.enableExpertPipeline ? params.aicCoreNum : physicalCoreNum;
+        if (params.enableExpertPipeline &&
+            (physicalCoreIdx < coreOffset || physicalCoreIdx >= coreOffset + coreNum)) {
+            return;
+        }
+        uint32_t coreIdx = physicalCoreIdx - coreOffset;
         int64_t gmGroupOffsetA = 0;
         int64_t gmGroupOffsetB = 0;
 
         AscendC::GlobalTensor<ElementC> gmC;
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.ptrWorkspace));
-        auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+        auto layoutC = layout::RowMajor{L1TileShape::M * physicalCoreNum * WORKSPACE_STAGES, L1TileShape::N};
 
         uint32_t stageId = 0;
         uint32_t stageUsed = 0;
         uint32_t startCoreIdx = 0;
         for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+            WaitExpertReady(params, groupIdx);
             if constexpr (EXEC_FLAG & EXEC_FLAG_TENSOR_LIST) {
                 gmB.SetGlobalBuffer(reinterpret_cast<__gm__ ElementB *>(
                         gmBlistTensorDesc.GetDataPtr<int32_t>(groupIdx)));
@@ -177,7 +217,7 @@ public:
                 // Compute initial location in logical coordinates
                 MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
                 MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
-                MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+                MatrixCoord offsetC{(stageId * physicalCoreNum + physicalCoreIdx) * L1TileShape::M, 0};
                 int64_t gmOffsetA = layoutA.GetOffset(offsetA);
                 int64_t gmOffsetB = layoutB.GetOffset(offsetB);
                 int64_t gmOffsetC = layoutC.GetOffset(offsetC);
@@ -228,8 +268,13 @@ public:
             BlockScheduler blockScheduler;
             BlockEpilogue blockEpilogue(resource, combiner->GetCalcInfo());
 
-            uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-            uint32_t coreNum = AscendC::GetBlockNum();
+            uint32_t physicalCoreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+            uint32_t physicalCoreNum = AscendC::GetBlockNum();
+            uint32_t coreOffset = params.enableExpertPipeline ? params.aicCoreOffset : 0;
+            uint32_t coreNum = params.enableExpertPipeline ? params.aicCoreNum : physicalCoreNum;
+            bool processEpilogue = !params.enableExpertPipeline ||
+                                   (physicalCoreIdx >= coreOffset && physicalCoreIdx < coreOffset + coreNum);
+            uint32_t coreIdx = processEpilogue ? (physicalCoreIdx - coreOffset) : 0;
             int64_t gmGroupOffsetScale = 0;
             int64_t gmGroupOffsetPerTokenScale = 0;
             int64_t gmGroupOffsetD = 0;
@@ -238,7 +283,7 @@ public:
 
             AscendC::GlobalTensor<ElementC> gmC;
             gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.ptrWorkspace));
-            auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+            auto layoutC = layout::RowMajor{L1TileShape::M * physicalCoreNum * WORKSPACE_STAGES, L1TileShape::N};
 
             uint32_t stageId = 0;
             uint32_t startCoreIdx = 0;
@@ -248,7 +293,7 @@ public:
             if constexpr (!(EXEC_FLAG & EXEC_FLAG_TENSOR_LIST)) {
                 gmScalePtr = reinterpret_cast<__gm__ ElementScale*>(gmScaleListTensor.GetDataPtr<int32_t>(0));
             }
-            for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+            for (uint32_t groupIdx = 0; processEpilogue && groupIdx < params.problemCount; ++groupIdx) {
                 uint32_t currentM = (groupIdx == 0) ? groupList.GetValue(groupIdx)
                                                     : (groupList.GetValue(groupIdx) - groupList.GetValue(groupIdx - 1));
                 GemmCoord inGroupProblemShape{currentM, params.problemShape.n(), params.problemShape.k()};
@@ -283,7 +328,7 @@ public:
                     GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
                     GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
 
-                    MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+                    MatrixCoord offsetC{(stageId * physicalCoreNum + physicalCoreIdx) * L1TileShape::M, 0};
                     int64_t gmOffsetC = layoutC.GetOffset(offsetC);
                     auto gmBlockC = gmC[gmOffsetC];
                     auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
@@ -304,6 +349,11 @@ public:
 
                 startCoreIdx = (startCoreIdx + coreLoops) % coreNum;
             }
+        }
+
+        if (params.enableExpertPipeline) {
+            AscendC::SyncAll<false>();
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
 
         icache_preload(4);

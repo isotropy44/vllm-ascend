@@ -26,7 +26,7 @@ namespace Catlass::Gemm::Kernel {
 
 constexpr uint32_t TOKEN_ORDER_METADATA_OFFSET = WIN_STATE_OFFSET + SELF_STATE_OFFSET + 32 * 1024;
 constexpr uint64_t TOKEN_ORDER_METADATA_LIMIT = STATE_WIN_OFFSET - TOKEN_ORDER_METADATA_OFFSET;
-constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = 256 * 1024;
+constexpr uint32_t DYNAMIC_QUANT_READY_WORKSPACE_SIZE = RESERVED_WORKSPACE_SIZE;
 constexpr uint32_t PIPELINE_QUANT_ROW_ONCE = 1;
 using TokenOrderMetadataType = uint8_t;
 static_assert(TOKEN_ORDER_METADATA_OFFSET < STATE_WIN_OFFSET, "token-order metadata must stay before state window");
@@ -330,7 +330,7 @@ public:
 
         GM_ADDR gmExpandIdx;
         GM_ADDR gmEpSendCount;
-        GM_ADDR gmResvered;
+        GM_ADDR gmReserved;
         GM_ADDR gmExpertTokenNums;
 
         uint32_t epRankSize;
@@ -355,7 +355,7 @@ public:
                LayoutPerTokenScale const &layoutPerTokenScale_, GM_ADDR ptrOutput_, LayoutOutput const &layoutOutput_,
                GM_ADDR ptrDequantScale_, LayoutDequantScale const &layoutDequantScale_, GM_ADDR ptrWorkspace_,
                GM_ADDR gmX_, GM_ADDR debugGm_, GM_ADDR gmexpertIds_, GM_ADDR gmExpandIdx_, GM_ADDR gmEpSendCount_, GM_ADDR gmXActiveMask_,
-               GM_ADDR gmResvered_, GM_ADDR gmExpertTokenNums_, uint32_t epRankSize_, uint32_t epRankId_,
+               GM_ADDR gmReserved_, GM_ADDR gmExpertTokenNums_, uint32_t epRankSize_, uint32_t epRankId_,
                uint32_t moeExpertNum_, uint32_t moeExpertNumPerRank_, uint32_t sharedExpertNum_,
                uint32_t sharedExpertRankNum_, uint32_t quantMode_, uint32_t globalBs_, uint32_t bs_, uint32_t topK_,
                uint32_t h)
@@ -382,7 +382,7 @@ public:
               gmEpSendCount(gmEpSendCount_),
               gmExpertTokenNums(gmExpertTokenNums_),
               gmXActiveMask(gmXActiveMask_), 
-              gmResvered(gmResvered_),
+              gmReserved(gmReserved_),
               epRankSize(epRankSize_),
               epRankId(epRankId_),
               moeExpertNum(moeExpertNum_),
@@ -455,7 +455,18 @@ public:
     {
         uint32_t expectedNTiles = CeilDivU32(params.problemShape.n(), L1TileShape::N);
         uint64_t flagCount = static_cast<uint64_t>(params.problemShape.m()) * expectedNTiles;
-        return flagCount * UB_ALIGN <= DYNAMIC_QUANT_READY_WORKSPACE_SIZE;
+        uint64_t expertStateBytes = static_cast<uint64_t>(localExpertNum) * EXPERT_PIPELINE_STATE_ENTRY_SIZE * 2;
+        return expertStateBytes + flagCount * UB_ALIGN <= DYNAMIC_QUANT_READY_WORKSPACE_SIZE;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetGmm1AicCoreNum(uint32_t coreNum) const
+    {
+        if (!enableQuantPipeline) {
+            return coreNum;
+        }
+        uint32_t halfCoreNum = coreNum / ODD_EVEN_BASE;
+        return halfCoreNum > 0 ? halfCoreNum : 1;
     }
 
     CATLASS_DEVICE
@@ -504,6 +515,24 @@ public:
         }
         enableQuantPipeline = ShouldEnableQuantPipeline(params);
         recvCompCoreNum = enableQuantPipeline ? GetPlannedRecvCompCoreNum(aiCoreGroupNum) : recvCoreNum;
+        gmm1AicCoreNum = GetGmm1AicCoreNum(aiCoreGroupNum);
+        if (enableQuantPipeline) {
+            AscendC::GlobalTensor<uint32_t> stateTensor;
+            for (uint32_t flagIdx = aicIdx; flagIdx < localExpertNum * 2; flagIdx += aiCoreGroupNum) {
+                stateTensor.SetGlobalBuffer((__gm__ uint32_t *)(params.gmReserved +
+                                            flagIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+                stateTensor.SetValue(0, 0);
+                __asm__ __volatile__("");
+                AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                  AscendC::DcciDst::CACHELINE_OUT>(stateTensor[0]);
+                __asm__ __volatile__("");
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::SyncAll<false>();
+        }
+        if (enableQuantPipeline && aicIdx >= gmm1AicCoreNum) {
+            return;
+        }
         winContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
 
         // state of cv flag
@@ -581,9 +610,9 @@ public:
             uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
             // Determine the starting loopIdx of the current core under the current groupIdx
-            uint32_t startLoopIdx = ((aicIdx < startCoreIdx) ? (aicIdx + aicNum) : aicIdx) - startCoreIdx;
+            uint32_t startLoopIdx = ((aicIdx < startCoreIdx) ? (aicIdx + gmm1AicCoreNum) : aicIdx) - startCoreIdx;
             // Loop through the matmul of each groupIdx
-            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1AicCoreNum) {
                 // Compute block location
                 GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
                 GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
@@ -626,7 +655,7 @@ public:
                 gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
             }
 
-            startCoreIdx = (startCoreIdx + coreLoops) % aicNum;
+            startCoreIdx = (startCoreIdx + coreLoops) % gmm1AicCoreNum;
         }
 
         if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
@@ -639,7 +668,9 @@ public:
             target += 1;
             --stageUsed;
         }
-        AscendC::SyncAll<false>();
+        if (!enableQuantPipeline) {
+            AscendC::SyncAll<false>();
+        }
     }
 
     CATLASS_DEVICE 
@@ -821,10 +852,10 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
 
         if (!isShareExpert) {
-            for (uint32_t curSatatusExpId = 0; curSatatusExpId < sharedExpertRankNum; ++curSatatusExpId) {
-                int32_t curExpertCnt = (curSatatusExpId + 1 + epRankId) * axisBS / sharedExpertRankNum -
-                                       (curSatatusExpId + epRankId) * axisBS / sharedExpertRankNum;
-                statusTensor_((curSatatusExpId)*INT32_COUNT_PER_BLOCK + 1) = curExpertCnt;
+            for (uint32_t curStatusExpId = 0; curStatusExpId < sharedExpertRankNum; ++curStatusExpId) {
+                int32_t curExpertCnt = (curStatusExpId + 1 + epRankId) * axisBS / sharedExpertRankNum -
+                                       (curStatusExpId + epRankId) * axisBS / sharedExpertRankNum;
+                statusTensor_((curStatusExpId)*INT32_COUNT_PER_BLOCK + 1) = curExpertCnt;
             }
         }
 
@@ -911,7 +942,7 @@ public:
     }
 
     CATLASS_DEVICE
-    void SendToShareExprt(GM_ADDR gmX, GM_ADDR gmX1, GM_ADDR gmX1Scale)
+    void SendToShareExpert(GM_ADDR gmX, GM_ADDR gmX1, GM_ADDR gmX1Scale)
     {
         uint32_t newAivId = sendCoreIdx - sendToMoeAivNum;
         uint32_t sendTokenNum = activeMaskBsCnt / sendToShareAivNum;
@@ -1000,7 +1031,7 @@ public:
     }
 
     CATLASS_DEVICE
-    void SendToMoeExprt(GM_ADDR gmX, GM_ADDR gmExpandIdx)
+    void SendToMoeExpert(GM_ADDR gmX, GM_ADDR gmExpandIdx)
     {
         uint32_t sendTokenNum = expertIdsCnt / sendToMoeAivNum;
         uint32_t remainderTokenNum = expertIdsCnt % sendToMoeAivNum;
@@ -1048,7 +1079,7 @@ public:
                 if (dstExpertId < 0) {
                     continue;
                 }
-                // Send to preferentically to the specicied expert
+                // Send preferentially to the specified expert
                 if ((dstExpertId % moeExpertNumPerRank) != sendGroupIndex) {
                     continue;
                 }
@@ -1130,9 +1161,9 @@ public:
 
         AscendC::SetDeqScale((half)1.000000e+00f);
         if (hasShareExpert && sendCoreIdx >= sendToMoeAivNum) {
-            SendToShareExprt(gmX, gmX1, gmX1Scale);
+            SendToShareExpert(gmX, gmX1, gmX1Scale);
         } else {
-            SendToMoeExprt(gmX, gmExpandIdx);
+            SendToMoeExpert(gmX, gmExpandIdx);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -1201,10 +1232,10 @@ public:
         subUbOffset += CEIL_UP(expertCntUp * sizeof(float));
         AscendC::LocalTensor<float> statusFp32Tensor_ = statusTensor_.ReinterpretCast<float>();
         if (isShareExpert) {
-            for (uint32_t curSatatusExpId = 0; curSatatusExpId < sharedExpertRankNum; ++curSatatusExpId) {
-                int32_t curExpertCnt = (curSatatusExpId + 1 + epRankId) * axisBS / sharedExpertRankNum -
-                                    (curSatatusExpId + epRankId) * axisBS / sharedExpertRankNum;
-                statusTensor_((curSatatusExpId)*INT32_COUNT_PER_BLOCK + 1) = curExpertCnt;
+            for (uint32_t curStatusExpId = 0; curStatusExpId < sharedExpertRankNum; ++curStatusExpId) {
+                int32_t curExpertCnt = (curStatusExpId + 1 + epRankId) * axisBS / sharedExpertRankNum -
+                                    (curStatusExpId + epRankId) * axisBS / sharedExpertRankNum;
+                statusTensor_((curStatusExpId)*INT32_COUNT_PER_BLOCK + 1) = curExpertCnt;
             }
         }
 
@@ -1416,6 +1447,90 @@ public:
     }
 
     CATLASS_DEVICE
+    void ClearExpertPipelineState()
+    {
+        uint32_t stateEntryCount = localExpertNum * 2;
+        for (uint32_t flagIdx = aivIdx; flagIdx < stateEntryCount; flagIdx += aivNum) {
+            AscendC::GlobalTensor<uint32_t> stateTensor;
+            stateTensor.SetGlobalBuffer((__gm__ uint32_t *)(expertCounterBase + flagIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+            stateTensor.SetValue(0, 0);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(stateTensor[0]);
+            __asm__ __volatile__("");
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
+    void StoreExpertReadyFlag(uint32_t groupIdx)
+    {
+        AscendC::GlobalTensor<uint32_t> readyTensor;
+        readyTensor.SetGlobalBuffer((__gm__ uint32_t *)(expertReadyBase + groupIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+        readyTensor.SetValue(0, 1);
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(readyTensor[0]);
+        __asm__ __volatile__("");
+    }
+
+    CATLASS_DEVICE
+    void AddExpertQuantCounter(uint32_t groupIdx)
+    {
+        AscendC::GlobalTensor<int32_t> counterTensor;
+        counterTensor.SetGlobalBuffer((__gm__ int32_t *)(expertCounterBase + groupIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+        AscendC::LocalTensor<int32_t> oneTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        oneTensor.SetValue(0, 1);
+        AscendC::SetAtomicAdd<int32_t>();
+        AscendC::DataCopy(counterTensor, oneTensor, 1);
+        AscendC::SetAtomicNone();
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
+    uint32_t LoadExpertQuantCounter(uint32_t groupIdx)
+    {
+        AscendC::GlobalTensor<int32_t> counterTensor;
+        counterTensor.SetGlobalBuffer((__gm__ int32_t *)(expertCounterBase + groupIdx * EXPERT_PIPELINE_STATE_ENTRY_SIZE));
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(counterTensor[0]);
+        __asm__ __volatile__("");
+        return static_cast<uint32_t>(counterTensor.GetValue(0));
+    }
+
+    CATLASS_DEVICE
+    void PublishExpertQuantDone(uint32_t groupIdx, uint32_t currentM)
+    {
+        if (!enableQuantPipeline || currentM == 0) {
+            return;
+        }
+        AddExpertQuantCounter(groupIdx);
+        if (LoadExpertQuantCounter(groupIdx) >= currentM) {
+            StoreExpertReadyFlag(groupIdx);
+        }
+    }
+
+    CATLASS_DEVICE
+    bool GetQuantTileGroup(uint32_t quantTileId, __gm__ ElementGroupList_ *ptrGroupList,
+                           uint32_t &groupIdx, uint32_t &currentM)
+    {
+        AscendC::GlobalTensor<ElementGroupList> groupList;
+        groupList.SetGlobalBuffer(ptrGroupList);
+        uint32_t groupRowBase = 0;
+        for (uint32_t idx = 0; idx < localExpertNum; ++idx) {
+            uint32_t groupEnd = groupList.GetValue(idx);
+            if (quantTileId < groupEnd) {
+                groupIdx = idx;
+                currentM = groupEnd - groupRowBase;
+                return true;
+            }
+            groupRowBase = groupEnd;
+        }
+        return false;
+    }
+
+    CATLASS_DEVICE
     void PublishQuantReadyFlags(uint32_t expertRowBase, GemmCoord const &blockCoordMNK,
                                 GemmCoord const &actualBlockShapeMNK)
     {
@@ -1464,7 +1579,7 @@ public:
             AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
             gmScaleListTensor = AscendC::ListTensorDesc(reinterpret_cast<__gm__ void *>(gmScale));
 
-            for (uint32_t producerAicIdx = compCoreIdx; producerAicIdx < aicNum;
+            for (uint32_t producerAicIdx = compCoreIdx; producerAicIdx < gmm1AicCoreNum;
                  producerAicIdx += compCoreNum) {
                 int64_t gmGroupOffsetScale = 0;
                 int64_t gmGroupOffsetPerTokenScale = 0;
@@ -1519,8 +1634,8 @@ public:
 
                     GemmCoord blockShapeMNK = L1TileShape::ToCoord();
                     uint32_t producerStartLoopIdx =
-                        (producerAicIdx + aicNum - startCoreIdx) % aicNum;
-                    for (uint32_t loopIdx = producerStartLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
+                        (producerAicIdx + gmm1AicCoreNum - startCoreIdx) % gmm1AicCoreNum;
+                    for (uint32_t loopIdx = producerStartLoopIdx; loopIdx < coreLoops; loopIdx += gmm1AicCoreNum) {
                         GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
                         GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
 
@@ -1544,7 +1659,7 @@ public:
                     gmGroupOffsetD += currentM * n;
                     expertRowBase += currentM;
 
-                    startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
+                    startCoreIdx = (startCoreIdx + coreLoops) % gmm1AicCoreNum;
                 }
             }
         }
@@ -1614,6 +1729,7 @@ public:
             recvCoreNum = aiCoreGroupNum;
         }
         enableQuantPipeline = ShouldEnableQuantPipeline(params);
+        gmm1AicCoreNum = GetGmm1AicCoreNum(aiCoreGroupNum);
         recvCompCoreNum = recvCoreNum;
         recvCompCoreIdx = recvCoreIdx;
         isRecvCompCore = isRecvCore;
@@ -1647,10 +1763,13 @@ public:
         expertPerSizeOnWin = maxAxisBs * tokenLength * sizeof(XType);
         winContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
         statusDataSpaceGm = (GM_ADDR)(winContext_->localWindowsExp);
-        quantReadyBase = params.gmResvered;
+        expertCounterBase = params.gmReserved;
+        expertReadyBase = expertCounterBase + static_cast<uint64_t>(localExpertNum) * EXPERT_PIPELINE_STATE_ENTRY_SIZE;
+        quantReadyBase = expertReadyBase + static_cast<uint64_t>(localExpertNum) * EXPERT_PIPELINE_STATE_ENTRY_SIZE;
         quantExpectedNTiles = CeilDivU32(params.problemShape.n(), L1TileShape::N);
         quantReadyFlagCount = params.problemShape.m() * quantExpectedNTiles;
-        quantReadyWorkspaceBytes = quantReadyFlagCount * UB_ALIGN;
+        expertPipelineStateBytes = static_cast<uint64_t>(localExpertNum) * EXPERT_PIPELINE_STATE_ENTRY_SIZE * 2;
+        quantReadyWorkspaceBytes = expertPipelineStateBytes + quantReadyFlagCount * UB_ALIGN;
     }
 
     CATLASS_DEVICE
@@ -1684,7 +1803,7 @@ public:
     CATLASS_DEVICE
     void AivInitState()
     {
-        // state of data sapce
+        // state of data space
         AscendC::GlobalTensor<int32_t> selfDataStatusTensor;
         selfDataStatusTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + STATE_WIN_OFFSET));
         __asm__ __volatile__("");
@@ -1797,6 +1916,40 @@ public:
     }
 
     CATLASS_DEVICE
+    void PublishExpertTokenInfo(__gm__ ElementGroupList_ *ptrGroupList, GM_ADDR gmExpertTokenNums)
+    {
+        AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
+        AscendC::GlobalTensor<int64_t> expertTokenNumsOutGMTensor;
+        AscendC::GlobalTensor<int64_t> nonCumSumExpertTokenNumsTensor;
+        expertTokenNumsOutGMTensor.SetGlobalBuffer((__gm__ int64_t *)(ptrGroupList));
+        nonCumSumExpertTokenNumsTensor.SetGlobalBuffer((__gm__ int64_t *)gmExpertTokenNums);
+        uint32_t cumulativeTokenNum = 0;
+        for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
+            groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
+                                                     groupIdx * GROUP_INFO_SIZE);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
+            __asm__ __volatile__("");
+            uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
+            cumulativeTokenNum += currentM;
+            expertTokenNumsOutGMTensor.SetValue(groupIdx, cumulativeTokenNum);
+            nonCumSumExpertTokenNumsTensor.SetValue(groupIdx, currentM);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(expertTokenNumsOutGMTensor[groupIdx]);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<int64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(nonCumSumExpertTokenNumsTensor[groupIdx]);
+            __asm__ __volatile__("");
+            if (currentM == 0) {
+                StoreExpertReadyFlag(groupIdx);
+            }
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    CATLASS_DEVICE
     void WaitRecvCompGroup(uint32_t groupIdx)
     {
         AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
@@ -1863,6 +2016,7 @@ public:
     void RunPipelinedDynamicQuant(Params const &params, __gm__ float *gmSwigluOutput)
     {
         WaitAllRecvCompGroups();
+        PublishExpertTokenInfo(params.ptrGroupList, params.gmExpertTokenNums);
         totalTokenCount = LoadTotalTokenCount(params.gmEpSendCount);
         AscendC::PipeBarrier<PIPE_ALL>();
         uint32_t n = params.problemShape.n();
@@ -1879,6 +2033,11 @@ public:
             MatrixCoord blockCoord(quantTileId, 0);
             MatrixCoord actualBlockShape(PIPELINE_QUANT_ROW_ONCE, nOut);
             blockQuant(quantBlockShape, blockCoord, actualBlockShape);
+            uint32_t groupIdx = 0;
+            uint32_t currentM = 0;
+            if (GetQuantTileGroup(quantTileId, params.ptrGroupList, groupIdx, currentM)) {
+                PublishExpertQuantDone(groupIdx, currentM);
+            }
         }
     }
 
@@ -1890,6 +2049,7 @@ public:
         PrintTokenOrderMetadataFallback();
         PrintQuantPipelineFallback(params);
         if (enableQuantPipeline) {
+            ClearExpertPipelineState();
             ClearQuantReadyFlags();
             AscendC::SyncAll<false>();
             AscendC::PipeBarrier<PIPE_ALL>();
@@ -2031,6 +2191,7 @@ private:
     uint32_t compCoreNum{0};
     uint32_t recvCompCoreNum{0};
     uint32_t quantCoreNum{0};
+    uint32_t gmm1AicCoreNum{0};
     uint32_t aivIdx{0};
     uint32_t aicIdx{0};
     uint32_t sendCoreIdx{0};
@@ -2043,10 +2204,13 @@ private:
     uint32_t aicStateGlobalCoreIdx{0};
     uint32_t sendToMoeAivNum{0};
     uint32_t sendToShareAivNum{0};
+    GM_ADDR expertCounterBase{0};
+    GM_ADDR expertReadyBase{0};
     GM_ADDR quantReadyBase{0};
     uint32_t quantExpectedNTiles{0};
     uint32_t quantReadyFlagCount{0};
     uint32_t quantReadyWorkspaceBytes{0};
+    uint64_t expertPipelineStateBytes{0};
     uint64_t tokenOrderMetadataWorkspaceBytes{0};
     uint32_t quantEpoch{0};
 };

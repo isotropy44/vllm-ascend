@@ -37,6 +37,8 @@ constexpr int32_t BUFFER_NUM = 2;
 constexpr int32_t GATHER_SECOND_NUM = 2;
 constexpr uint32_t MAX_QUANT_ROW_ONCE = 8;
 constexpr uint32_t QUANT_SPACE_FACTOR = 176 * 1024 / 11;  // up to 176KB for quant
+constexpr uint32_t RESERVED_WORKSPACE_SIZE = 256 * 1024;
+constexpr uint32_t EXPERT_PIPELINE_STATE_ENTRY_SIZE = UB_ALIGN;
 #ifndef OPT_RANK_OFFSET
 #define OPT_RANK_OFFSET 512
 #endif

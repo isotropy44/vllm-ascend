@@ -64,7 +64,7 @@ CATLASS_DEVICE void GmmDeqSwigluQuant(GemmCoord problemShape, uint32_t groupCoun
                                   layout::VectorLayout layoutPerTokenScale, GM_ADDR gmD, layout::RowMajor layoutD,
                                   GM_ADDR gmDequantScale, layout::VectorLayout layoutDequantScale, GM_ADDR gmWorkspace,
                                   GM_ADDR gmX, GM_ADDR debugGm, GM_ADDR gmexpertIds, GM_ADDR gmExpandIdx,
-                                  GM_ADDR gmEpSendCount, GM_ADDR xActiveMask, GM_ADDR gmResvered, GM_ADDR gmExpertTokenNums,
+                                  GM_ADDR gmEpSendCount, GM_ADDR xActiveMask, GM_ADDR gmReserved, GM_ADDR gmExpertTokenNums,
                                   uint32_t epRankSize, uint32_t epRankId, uint32_t moeExpertNum,
                                   uint32_t moeExpertNumPerRank, uint32_t sharedExpertNum, uint32_t sharedExpertRankNum,
                                   uint32_t quantMode, uint32_t globalBs, uint32_t bs, uint32_t topK, uint32_t tokenLen)
@@ -139,7 +139,7 @@ CATLASS_DEVICE void GmmDeqSwigluQuant(GemmCoord problemShape, uint32_t groupCoun
                                            gmExpandIdx,
                                            gmEpSendCount,
                                            xActiveMask,
-                                           gmResvered,
+                                           gmReserved,
                                            gmExpertTokenNums,
                                            epRankSize,
                                            epRankId,
@@ -186,7 +186,8 @@ CATLASS_DEVICE void GmmDeq(GemmCoord problemShape, uint32_t groupCount, GM_ADDR 
                        GM_ADDR gmScale,
                        layout::VectorLayout layoutScale, GM_ADDR gmPerTokenScale,
                        layout::VectorLayout layoutPerTokenScale, GM_ADDR gmD, layout::RowMajor layoutD,
-                       GM_ADDR gmWorkspace, void *combiner)
+                       GM_ADDR gmWorkspace, void *combiner, GM_ADDR gmExpertReady = 0, uint32_t expertReadyEpoch = 0,
+                       bool enableExpertPipeline = false, uint32_t gmm2AicCoreOffset = 0, uint32_t gmm2AicCoreNum = 0)
 {
     using ArchTag = Arch::AtlasA2;
     using DispatchPolicy = DispatchPolicy_;
@@ -232,7 +233,8 @@ CATLASS_DEVICE void GmmDeq(GemmCoord problemShape, uint32_t groupCount, GM_ADDR 
 
     typename GemmKernel::Params params{
         problemShape, groupCount,      gmGroupList,         gmA, layoutA, gmB,         layoutB, gmScale,
-        layoutScale,  gmPerTokenScale, layoutPerTokenScale, gmD, layoutD, gmWorkspace, combiner};
+        layoutScale,  gmPerTokenScale, layoutPerTokenScale, gmD, layoutD, gmWorkspace, combiner, gmExpertReady,
+        expertReadyEpoch, enableExpertPipeline, gmm2AicCoreOffset, gmm2AicCoreNum};
 
     // call a kernel
     GemmKernel gemm;
@@ -358,6 +360,29 @@ __aicore__ inline auto CreateWeightLayout(uint32_t k, uint32_t n) {
     }
 }
 
+__aicore__ inline uint32_t GetPlannedRecvCompCoreNum(uint32_t localExpertNum, uint32_t coreNum)
+{
+    if (localExpertNum <= 1) {
+        return coreNum * SUB_AIV_NUM;
+    }
+    uint32_t halfCoreNum = coreNum / ODD_EVEN_BASE;
+    uint32_t plannedCoreNum = localExpertNum > halfCoreNum ? localExpertNum : halfCoreNum;
+    return plannedCoreNum < coreNum ? plannedCoreNum : coreNum;
+}
+
+__aicore__ inline bool ShouldEnableExpertPipeline(uint32_t localExpertNum, uint32_t coreNum, uint32_t maxTokenNum,
+                                                  uint32_t gmm1OutputDim)
+{
+    uint32_t plannedRecvCompCoreNum = GetPlannedRecvCompCoreNum(localExpertNum, coreNum);
+    if (localExpertNum <= 1 || plannedRecvCompCoreNum >= coreNum) {
+        return false;
+    }
+    uint32_t expectedNTiles = CEIL(gmm1OutputDim, GMM1_L1N);
+    uint64_t expertStateBytes = static_cast<uint64_t>(localExpertNum) * EXPERT_PIPELINE_STATE_ENTRY_SIZE * 2;
+    uint64_t readyFlagBytes = static_cast<uint64_t>(maxTokenNum) * expectedNTiles * UB_ALIGN;
+    return expertStateBytes + readyFlagBytes <= RESERVED_WORKSPACE_SIZE;
+}
+
 template <TemplateMC2TypeClass>
 __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
 {
@@ -373,9 +398,17 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
     layout::VectorLayout layoutW2Scale{gmm2OutputDim_};
     layout::VectorLayout layoutX2Scale{maxTokenNum_};
     layout::RowMajor layoutOutput{maxTokenNum_, gmm2OutputDim_};
+    bool enableExpertPipeline = ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) != 0) &&
+                                ShouldEnableExpertPipeline(groupCount_, blockDim_, maxTokenNum_, gmm1OutputDim_);
+    uint32_t gmm1AicCoreNum = enableExpertPipeline ? (blockDim_ / ODD_EVEN_BASE) : blockDim_;
+    if (gmm1AicCoreNum == 0) {
+        gmm1AicCoreNum = 1;
+    }
+    uint32_t gmm2AicCoreOffset = gmm1AicCoreNum;
+    uint32_t gmm2AicCoreNum = blockDim_ - gmm1AicCoreNum;
 
     size_t workspaceOffset = 0;
-    constexpr int32_t resveredWorkSpaceSize = 256 * 1024;
+    constexpr int32_t reservedWorkspaceSize = RESERVED_WORKSPACE_SIZE;
     int64_t x1TokenSize = maxTokenNum_ * tokenHiddenSize_ * sizeof(int8_t);
     int64_t x2TokenSize = maxTokenNum_ * gmm2InputDim_ * sizeof(int8_t);
     int64_t maxTokenSize = x1TokenSize < x2TokenSize ? x2TokenSize : x1TokenSize;
@@ -402,8 +435,9 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
     workspaceOffset += RoundUp<GM_ALIGN_BYTE>(static_cast<size_t>(bs_) * topK_ * sizeof(int32_t));
     GM_ADDR gmEpSendCount = workspaceGM_ + workspaceOffset;
     workspaceOffset += RoundUp<GM_ALIGN_BYTE>(static_cast<size_t>(epRankSize_) * groupCount_ * sizeof(int32_t));
-    GM_ADDR gmResvered = workspaceGM_ + workspaceOffset;
-    workspaceOffset += RoundUp<GM_ALIGN_BYTE>(resveredWorkSpaceSize);
+    GM_ADDR gmReserved = workspaceGM_ + workspaceOffset;
+    GM_ADDR gmExpertReady = gmReserved + static_cast<uint64_t>(groupCount_) * EXPERT_PIPELINE_STATE_ENTRY_SIZE;
+    workspaceOffset += RoundUp<GM_ALIGN_BYTE>(reservedWorkspaceSize);
 
     if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
         if constexpr (g_coreType == AscendC::AIV) {
@@ -430,16 +464,18 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
                       Gmm1BlockScheduler>(
         gmm1ProblemShape, groupCount_, gmGroupList, gmX1, layoutX1, gmPermuteWeight1_, layoutWeight1,
         gmPermuteScale1_, layoutW1Scale, gmX1Scale, layoutX1Scale, gmX2, layoutX2, gmX2Scale,
-        layoutX2Scale, gmWorkspace, gmX_, gmSmoothScales_, gmexpertIds_, gmExpandIdx, gmEpSendCount, xActiveMask_, gmResvered,
+        layoutX2Scale, gmWorkspace, gmX_, gmSmoothScales_, gmexpertIds_, gmExpandIdx, gmEpSendCount, xActiveMask_, gmReserved,
         gmExpertTokenNums_, epRankSize_, epRankId_, moeExpertNum_, moeExpertNumPerRank_, sharedExpertNum_,
         sharedExpertRankNum_, quantMode_, globalBs_, bs_, topK_, tokenHiddenSize_);
-    AscendC::PipeBarrier<PIPE_ALL>();
-    Arch::CrossCoreFlag gmm1AivFinished{0};
-    if constexpr (g_coreType == AscendC::AIV) {
-        Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
-        Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(gmm1AivFinished);
-    } else {
-        Arch::CrossCoreWaitFlag(gmm1AivFinished);
+    if (!enableExpertPipeline) {
+        AscendC::PipeBarrier<PIPE_ALL>();
+        Arch::CrossCoreFlag gmm1AivFinished{0};
+        if constexpr (g_coreType == AscendC::AIV) {
+            Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(gmm1AivFinished);
+        } else {
+            Arch::CrossCoreWaitFlag(gmm1AivFinished);
+        }
     }
 
     MoeDistributeCombineImpl::CamMoeDistributeCombine<TemplateMC2TypeFunc> combiner;
@@ -450,7 +486,8 @@ __aicore__ inline void DispatchGmmCombineDecode<TemplateMC2TypeFunc>::Process()
     GmmDeq<TemplateMC2TypeFunc, Gmm2L1TileShape, Gmm2L0TileShape, Gmm2EpilogueTileShape, Gmm2BlockScheduler,
            Gmm2DispatchPolicy>(gmm2ProblemShape, groupCount_, gmGroupList, gmX2, layoutX2, gmWeight2_, layoutWeight2,
                                gmScale2_, layoutW2Scale, gmX2Scale, layoutX2Scale, gmGmm2DepOut,
-                               layoutOutput, gmWorkspace, &combiner);
+                               layoutOutput, gmWorkspace, &combiner, gmExpertReady, 1, enableExpertPipeline,
+                               gmm2AicCoreOffset, gmm2AicCoreNum);
 }
 } // namespace DispatchGmmCombineDecodeImpl
 #endif  // DISPATCH_GMM_COMBINE_DECODE_H
