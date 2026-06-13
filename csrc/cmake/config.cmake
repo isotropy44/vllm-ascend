@@ -31,6 +31,16 @@ else()
 endif ()
 message(STATUS "ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}")
 
+set(ASCEND_ARCH_PKG_INC_DIRS)
+foreach (_pkg_inc_dir
+        ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc
+        ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/pkg_inc
+        ${ASCEND_CANN_PACKAGE_PATH}/arm64-linux/pkg_inc)
+    if (EXISTS ${_pkg_inc_dir})
+        list(APPEND ASCEND_ARCH_PKG_INC_DIRS ${_pkg_inc_dir})
+    endif ()
+endforeach ()
+
 # Detect A5-compatible SoC enum support from the CANN headers we are compiling against.
 set(_saved_CMAKE_REQUIRED_INCLUDES "${CMAKE_REQUIRED_INCLUDES}")
 set(CMAKE_REQUIRED_INCLUDES
